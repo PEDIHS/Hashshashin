@@ -1,0 +1,60 @@
+name: گزارش باگ
+about: گزارش مشکل در Core، Routing، Installer یا Transport
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ممنون که برای بهتر شدن Hashshashin گزارش می‌دهید. لطفاً اطلاعات زیر را کامل وارد کنید.
+  - type: input
+    id: version
+    attributes:
+      label: نسخه Hashshashin
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Full Tunnel
+        - Direct Return
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: محیط اجرا
+      description: سیستم‌عامل، Provider، نوع VPS و نسخه Kernel را بنویسید.
+      placeholder: Ubuntu 22.04 / Kernel 5.x / VPS Provider ...
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: مشکل
+      description: دقیقاً چه چیزی رخ می‌دهد و چه چیزی انتظار داشتید؟
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: خروجی journalctl و دستورات مرتبط را قرار دهید. Shared Key و اطلاعات حساس را حذف کنید.
+      render: shell
+  - type: textarea
+    id: network
+    attributes:
+      label: اطلاعات شبکه
+      description: خروجی‌های ip addr، ip rule و routeهای مرتبط را بدون اطلاعات حساس وارد کنید.
+      render: shell
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Shared Key و اطلاعات حساس را از گزارش حذف کرده‌ام.
+          required: true
+        - label: README و Troubleshooting را بررسی کرده‌ام.
+          required: true
