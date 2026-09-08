@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Port struct {
@@ -45,6 +46,7 @@ type Config struct {
 		Listen                string    `json:"listen"`
 		Peer                  string    `json:"peer"`
 		Key                   string    `json:"key"`
+		WebSocketPath         string    `json:"websocket_path,omitempty"`
 		KeepaliveSeconds      int       `json:"keepalive_seconds"`
 		SessionTimeoutSeconds int       `json:"session_timeout_seconds"`
 		RekeyMinutes          int       `json:"rekey_minutes"`
@@ -90,8 +92,18 @@ func loadConfig(path string) (*Config, error) {
 	if c.Transport.Type == "" {
 		c.Transport.Type = "udp"
 	}
-	if c.Transport.Type != "udp" && c.Transport.Type != "tcp" && c.Transport.Type != "kcp" {
-		return nil, errors.New("transport.type must be udp, tcp or kcp")
+	switch c.Transport.Type {
+	case "udp", "tcp", "tls", "kcp", "ws", "wss":
+	default:
+		return nil, errors.New("transport.type must be udp, tcp, tls, kcp, ws or wss")
+	}
+	if c.Transport.Type == "ws" || c.Transport.Type == "wss" {
+		if c.Transport.WebSocketPath == "" {
+			c.Transport.WebSocketPath = "/hsh"
+		}
+		if !validWebSocketPath(c.Transport.WebSocketPath) {
+			return nil, errors.New("transport.websocket_path must be a simple absolute path up to 128 characters")
+		}
 	}
 	if c.Tun.Name == "" {
 		c.Tun.Name = "hsh0"
@@ -212,6 +224,13 @@ func loadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
+func validWebSocketPath(path string) bool {
+	if len(path) < 1 || len(path) > 128 || path[0] != '/' {
+		return false
+	}
+	return !strings.ContainsAny(path, " \t\r\n?#")
+}
+
 func applySmartReturnDefaults(s *SmartReturnConfig) {
 	if s.ProbePort == 0 {
 		s.ProbePort = 9001
@@ -300,7 +319,7 @@ func validateKCP(k KCPConfig) error {
 
 func validateTransportAddress(kind, addr string) error {
 	switch kind {
-	case "tcp":
+	case "tcp", "tls", "ws", "wss":
 		_, err := net.ResolveTCPAddr("tcp4", addr)
 		return err
 	case "udp", "kcp":
