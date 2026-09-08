@@ -9,20 +9,18 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
 const (
-	magic               = "HSH1"
-	msgHello       byte  = 1
-	msgHelloAck    byte  = 2
-	msgData        byte  = 3
-	msgKeepalive   byte  = 4
-	transportMark        = 0x77
+	magic              = "HSH1"
+	msgHello      byte = 1
+	msgHelloAck   byte = 2
+	msgData       byte = 3
+	msgKeepalive  byte = 4
+	transportMark      = 0x77
 )
 
 type helloRecord struct {
@@ -62,31 +60,7 @@ func (s *tunnelState) clearIf(v *session) bool {
 	return true
 }
 
-func listenMarkedUDP(ctx context.Context, listen string) (*net.UDPConn, error) {
-	lc := net.ListenConfig{Control: func(network, address string, rc syscall.RawConn) error {
-		var setErr error
-		if err := rc.Control(func(fd uintptr) {
-			if e := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 36, transportMark); e != nil {
-				setErr = e
-			}
-		}); err != nil {
-			return err
-		}
-		return setErr
-	}}
-	pc, err := lc.ListenPacket(ctx, "udp4", listen)
-	if err != nil {
-		return nil, fmt.Errorf("listen UDP %s: %w", listen, err)
-	}
-	u, ok := pc.(*net.UDPConn)
-	if !ok {
-		_ = pc.Close()
-		return nil, fmt.Errorf("unexpected packet connection type")
-	}
-	return u, nil
-}
-
-func clientSupervisor(ctx context.Context, u *net.UDPConn, peer *net.UDPAddr, key []byte, st *tunnelState, c *Config) {
+func clientSupervisor(ctx context.Context, carrier packetCarrier, key []byte, st *tunnelState, c *Config) {
 	keep := time.NewTicker(time.Duration(c.Transport.KeepaliveSeconds) * time.Second)
 	defer keep.Stop()
 	for {
@@ -94,10 +68,10 @@ func clientSupervisor(ctx context.Context, u *net.UDPConn, peer *net.UDPAddr, ke
 		needHandshake := ss == nil || ss.idle() > time.Duration(c.Transport.SessionTimeoutSeconds)*time.Second || ss.age() > time.Duration(c.Transport.RekeyMinutes)*time.Minute
 		if needHandshake {
 			hctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-			err := handshakeClient(hctx, u, peer, key, st)
+			err := handshakeClient(hctx, carrier, carrier.DefaultPeer(), key, st)
 			cancel()
 			if err != nil && ctx.Err() == nil {
-				log.Printf("handshake: %v; retrying", err)
+				log.Printf("%s handshake: %v; retrying", carrier.Name(), err)
 			}
 		}
 		select {
@@ -105,13 +79,13 @@ func clientSupervisor(ctx context.Context, u *net.UDPConn, peer *net.UDPAddr, ke
 			return
 		case <-keep.C:
 			if ss = st.loadSession(); ss != nil {
-				_ = sendEncrypted(u, ss, msgKeepalive, nil)
+				_ = sendEncrypted(carrier, ss, msgKeepalive, nil)
 			}
 		}
 	}
 }
 
-func serverSupervisor(ctx context.Context, u *net.UDPConn, st *tunnelState, c *Config) {
+func serverSupervisor(ctx context.Context, carrier packetCarrier, st *tunnelState, c *Config) {
 	ticker := time.NewTicker(time.Duration(c.Transport.KeepaliveSeconds) * time.Second)
 	defer ticker.Stop()
 	for {
@@ -128,12 +102,15 @@ func serverSupervisor(ctx context.Context, u *net.UDPConn, st *tunnelState, c *C
 				log.Printf("session expired; waiting for Iran re-handshake")
 				continue
 			}
-			_ = sendEncrypted(u, ss, msgKeepalive, nil)
+			_ = sendEncrypted(carrier, ss, msgKeepalive, nil)
 		}
 	}
 }
 
-func handshakeClient(ctx context.Context, u *net.UDPConn, peer *net.UDPAddr, key []byte, st *tunnelState) error {
+func handshakeClient(ctx context.Context, carrier packetCarrier, peer string, key []byte, st *tunnelState) error {
+	if peer == "" {
+		return fmt.Errorf("carrier peer is not configured")
+	}
 	var cn [32]byte
 	if _, err := rand.Read(cn[:]); err != nil {
 		return err
@@ -155,18 +132,19 @@ func handshakeClient(ctx context.Context, u *net.UDPConn, peer *net.UDPAddr, key
 	poll := time.NewTicker(50 * time.Millisecond)
 	defer retry.Stop()
 	defer poll.Stop()
-	if _, err := u.WriteToUDP(hello, peer); err != nil {
+	if err := carrier.WritePacket(hello, peer); err != nil {
 		return err
 	}
+	started := time.Now()
 	for {
-		if ss := st.loadSession(); ss != nil && ss.created.After(time.Now().Add(-3*time.Second)) {
+		if ss := st.loadSession(); ss != nil && ss.created.After(started.Add(-time.Second)) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-retry.C:
-			if _, err := u.WriteToUDP(hello, peer); err != nil {
+			if err := carrier.WritePacket(hello, peer); err != nil {
 				return err
 			}
 		case <-poll.C:
@@ -196,15 +174,19 @@ func makeHelloAck(key []byte, cn, sn [32]byte) []byte {
 	return append(p, h.Sum(nil)...)
 }
 
-func recvLoop(ctx context.Context, u *net.UDPConn, tun io.Writer, key []byte, st *tunnelState, role string) {
-	b := make([]byte, 65535)
+func recvLoop(ctx context.Context, carrier packetCarrier, tun io.Writer, key []byte, st *tunnelState, role string) {
+	b := make([]byte, maxCarrierFrame)
 	for {
-		n, peer, err := u.ReadFromUDP(b)
+		n, peer, err := carrier.ReadPacket(b)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Printf("transport receive: %v", err)
+				log.Printf("%s receive: %v", carrier.Name(), err)
 			}
-			return
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 		if n < 5 || string(b[:4]) != magic {
 			continue
@@ -212,7 +194,7 @@ func recvLoop(ctx context.Context, u *net.UDPConn, tun io.Writer, key []byte, st
 		switch b[4] {
 		case msgHello:
 			if role == "kharej" {
-				handleHello(u, peer, b[:n], key, st)
+				handleHello(carrier, peer, b[:n], key, st)
 			}
 		case msgHelloAck:
 			if role == "iran" {
@@ -224,7 +206,7 @@ func recvLoop(ctx context.Context, u *net.UDPConn, tun io.Writer, key []byte, st
 	}
 }
 
-func handleHello(u *net.UDPConn, peer *net.UDPAddr, p, key []byte, st *tunnelState) {
+func handleHello(carrier packetCarrier, peer string, p, key []byte, st *tunnelState) {
 	if len(p) != 77 {
 		return
 	}
@@ -250,7 +232,7 @@ func handleHello(u *net.UDPConn, peer *net.UDPAddr, p, key []byte, st *tunnelSta
 	if old, ok := st.hellos[cn]; ok {
 		ack := append([]byte(nil), old.ack...)
 		st.helloMu.Unlock()
-		_, _ = u.WriteToUDP(ack, peer)
+		_ = carrier.WritePacket(ack, peer)
 		return
 	}
 	var sn [32]byte
@@ -268,11 +250,11 @@ func handleHello(u *net.UDPConn, peer *net.UDPAddr, p, key []byte, st *tunnelSta
 	st.helloMu.Unlock()
 
 	st.storeSession(ss)
-	_, _ = u.WriteToUDP(ack, peer)
-	log.Printf("session established from %s", peer)
+	_ = carrier.WritePacket(ack, peer)
+	log.Printf("session established from %s over %s", peer, carrier.Name())
 }
 
-func handleHelloAck(peer *net.UDPAddr, p, key []byte, st *tunnelState) {
+func handleHelloAck(peer string, p, key []byte, st *tunnelState) {
 	if len(p) != 101 {
 		return
 	}
@@ -302,12 +284,12 @@ func handleHelloAck(peer *net.UDPAddr, p, key []byte, st *tunnelState) {
 	log.Printf("session established to %s", peer)
 }
 
-func handleEncrypted(tun io.Writer, peer *net.UDPAddr, p []byte, st *tunnelState) {
+func handleEncrypted(tun io.Writer, peer string, p []byte, st *tunnelState) {
 	if len(p) < 29 {
 		return
 	}
 	ss := st.loadSession()
-	if ss == nil || !udpAddrEqual(peer, ss.peer) {
+	if ss == nil || peer != ss.peer {
 		return
 	}
 	counter := binary.BigEndian.Uint64(p[5:13])
@@ -323,7 +305,7 @@ func handleEncrypted(tun io.Writer, peer *net.UDPAddr, p []byte, st *tunnelState
 	}
 }
 
-func sendEncrypted(u *net.UDPConn, s *session, typ byte, payload []byte) error {
+func sendEncrypted(carrier packetCarrier, s *session, typ byte, payload []byte) error {
 	counter := atomic.AddUint64(&s.tx, 1)
 	header := make([]byte, 13)
 	copy(header[:4], magic)
@@ -332,7 +314,7 @@ func sendEncrypted(u *net.UDPConn, s *session, typ byte, payload []byte) error {
 	nonce := makeNonce(counter)
 	ciphertext := s.txAEAD.Seal(nil, nonce[:], payload, header)
 	packet := append(header, ciphertext...)
-	_, err := u.WriteToUDP(packet, s.peer)
+	err := carrier.WritePacket(packet, s.peer)
 	if err == nil {
 		atomic.AddUint64(&s.txBytes, uint64(len(payload)))
 	}
@@ -352,8 +334,4 @@ func statsLoop(ctx context.Context, st *tunnelState) {
 			}
 		}
 	}
-}
-
-func udpAddrEqual(a, b *net.UDPAddr) bool {
-	return a != nil && b != nil && a.Port == b.Port && a.IP.Equal(b.IP)
 }
