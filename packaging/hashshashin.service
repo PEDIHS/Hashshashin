@@ -1,0 +1,31 @@
+[Unit]
+Description=Hashshashin L3 Tunnel
+Documentation=https://github.com/PEDIHS/Hashshashin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/hashshashin -check -c /etc/hashshashin/config.json
+ExecStart=/usr/local/bin/hashshashin -c /etc/hashshashin/config.json
+ExecStopPost=-/usr/local/bin/hashshashin -cleanup -c /etc/hashshashin/config.json
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+KillSignal=SIGTERM
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/run /etc/hashshashin
+
+[Install]
+WantedBy=multi-user.target

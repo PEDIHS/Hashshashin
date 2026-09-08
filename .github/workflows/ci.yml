@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'dev/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go: ['1.18.x', '1.22.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Unit and transport integration tests
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build -trimpath -ldflags='-s -w -X main.buildRef=ci' ./...
+      - name: Installer syntax
+        run: bash -n install.sh
