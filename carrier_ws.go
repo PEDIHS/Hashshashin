@@ -18,6 +18,7 @@ type wsCarrier struct {
 	listener  net.Listener
 	tlsConfig *tls.Config
 	dialAddr  string
+	dialRaw   func(context.Context) (net.Conn, error)
 	connectMu sync.Mutex
 	peerMu    sync.Mutex
 	peer      *wsPeer
@@ -32,6 +33,9 @@ func newWebSocketCarrier(ctx context.Context, c *Config, secure bool) (packetCar
 	w := &wsCarrier{name: name, ctx: ctx, path: c.Transport.WebSocketPath, secure: secure}
 	if c.Role == "iran" {
 		w.dialAddr = c.Transport.Peer
+		w.dialRaw = func(dctx context.Context) (net.Conn, error) {
+			return dialMarkedStream(dctx, "tcp4", c.Transport.Peer)
+		}
 		return w, nil
 	}
 
@@ -69,11 +73,7 @@ func (w *wsCarrier) ensurePeer() (*wsPeer, error) {
 
 	var p *wsPeer
 	var err error
-	if w.listener != nil {
-		p, err = w.acceptPeer()
-	} else {
-		p, err = w.dialPeer()
-	}
+	if w.listener != nil { p, err = w.acceptPeer() } else { p, err = w.dialPeer() }
 	if err != nil { return nil, err }
 	w.peerMu.Lock()
 	defer w.peerMu.Unlock()
@@ -100,7 +100,11 @@ func (w *wsCarrier) dialPeer() (*wsPeer, error) {
 	if w.dialAddr == "" { return nil, fmt.Errorf("%s peer is not configured", w.name) }
 	dctx, cancel := context.WithTimeout(w.ctx, 8*time.Second)
 	defer cancel()
-	raw, err := dialMarkedStream(dctx, "tcp4", w.dialAddr)
+	var (
+		raw net.Conn
+		err error
+	)
+	if w.dialRaw != nil { raw, err = w.dialRaw(dctx) } else { raw, err = dialMarkedStream(dctx, "tcp4", w.dialAddr) }
 	if err != nil { return nil, fmt.Errorf("dial %s carrier %s: %w", w.name, w.dialAddr, err) }
 	_ = markStreamConn(raw)
 	conn := raw
@@ -116,10 +120,7 @@ func (w *wsCarrier) dialPeer() (*wsPeer, error) {
 func (w *wsCarrier) resetPeer(p *wsPeer) {
 	w.peerMu.Lock()
 	defer w.peerMu.Unlock()
-	if w.peer == p {
-		_ = w.peer.Close()
-		w.peer = nil
-	}
+	if w.peer == p { _ = w.peer.Close(); w.peer = nil }
 }
 
 func (w *wsCarrier) ReadPacket(buf []byte) (int, string, error) {
@@ -149,10 +150,7 @@ func (w *wsCarrier) WritePacket(packet []byte, peer string) error {
 	for attempts := 0; attempts < 2; attempts++ {
 		p, err := w.ensurePeer()
 		if err != nil { return err }
-		if err := p.writeBinary(packet); err != nil {
-			w.resetPeer(p)
-			continue
-		}
+		if err := p.writeBinary(packet); err != nil { w.resetPeer(p); continue }
 		return nil
 	}
 	return fmt.Errorf("%s carrier write failed after reconnect", w.name)
@@ -163,9 +161,7 @@ func (w *wsCarrier) Close() error {
 	w.closed = true
 	var err error
 	if w.peer != nil { err = w.peer.Close(); w.peer = nil }
-	if w.listener != nil {
-		if e := w.listener.Close(); err == nil { err = e }
-	}
+	if w.listener != nil { if e := w.listener.Close(); err == nil { err = e } }
 	w.peerMu.Unlock()
 	return err
 }
