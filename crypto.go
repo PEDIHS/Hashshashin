@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +53,7 @@ func (r *replayWindow) accept(counter uint64) bool {
 type session struct {
 	txAEAD   cipher.AEAD
 	rxAEAD   cipher.AEAD
-	peer     *net.UDPAddr
+	peer     string
 	created  time.Time
 	tx       uint64
 	replay   replayWindow
@@ -73,7 +72,7 @@ func (s *session) idle() time.Duration {
 	return time.Since(time.Unix(0, v))
 }
 
-func deriveSession(psk, cn, sn []byte, peer *net.UDPAddr, initiator bool) (*session, error) {
+func deriveSession(psk, cn, sn []byte, peer string, initiator bool) (*session, error) {
 	derive := func(label string) []byte {
 		h := hmac.New(sha256.New, psk)
 		h.Write([]byte("hashshashin/v1/" + label))
@@ -97,10 +96,7 @@ func deriveSession(psk, cn, sn []byte, peer *net.UDPAddr, initiator bool) (*sess
 		return nil, err
 	}
 
-	s := &session{
-		peer:    &net.UDPAddr{IP: append(net.IP(nil), peer.IP...), Port: peer.Port, Zone: peer.Zone},
-		created: time.Now(),
-	}
+	s := &session{peer: peer, created: time.Now()}
 	if initiator {
 		s.txAEAD, s.rxAEAD = c2s, s2c
 	} else {
