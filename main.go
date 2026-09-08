@@ -18,7 +18,7 @@ import (
 var buildRef = "source"
 
 const (
-	version     = "0.2.0-alpha"
+	version     = "0.3.0-alpha"
 	managerPath = "/usr/local/libexec/hashshashin-manager"
 )
 
@@ -40,9 +40,7 @@ func main() {
 	flag.Parse()
 
 	if *menu {
-		if err := launchManager(); err != nil {
-			log.Fatal(err)
-		}
+		if err := launchManager(); err != nil { log.Fatal(err) }
 		return
 	}
 	if *showVersion {
@@ -51,36 +49,25 @@ func main() {
 	}
 	if *keygen {
 		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			log.Fatal(err)
-		}
+		if _, err := rand.Read(b); err != nil { log.Fatal(err) }
 		fmt.Println(base64.StdEncoding.EncodeToString(b))
 		return
 	}
 
 	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if *showSummary {
-		printConfigSummary(cfg)
-		return
-	}
+	if err != nil { log.Fatal(err) }
+	if *showSummary { printConfigSummary(cfg); return }
 	if *check {
 		fmt.Printf("Hashshashin %s: config ok (transport=%s)\n", version, cfg.Transport.Type)
 		return
 	}
-	if os.Geteuid() != 0 {
-		log.Fatal("Hashshashin must run as root")
-	}
+	if os.Geteuid() != 0 { log.Fatal("Hashshashin must run as root") }
 	if *cleanup {
 		cleanupSmartReturnPolicy(cfg)
 		cleanupRouting(cfg)
 		return
 	}
-	if err := run(cfg); err != nil {
-		log.Fatal(err)
-	}
+	if err := run(cfg); err != nil { log.Fatal(err) }
 }
 
 func launchManager() error {
@@ -88,24 +75,19 @@ func launchManager() error {
 		return fmt.Errorf("management panel is not installed at %s; run the official installer again", managerPath)
 	}
 	cmd := exec.Command(managerPath)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin; cmd.Stdout = os.Stdout; cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func printConfigSummary(c *Config) {
 	ports := make([]string, 0, len(c.Ports))
-	for _, p := range c.Ports {
-		ports = append(ports, strconv.Itoa(p.Port)+"/"+p.Protocol)
-	}
+	for _, p := range c.Ports { ports = append(ports, strconv.Itoa(p.Port)+"/"+p.Protocol) }
 	peer := c.Transport.Peer
-	if peer == "" {
-		peer = "-"
-	}
+	if peer == "" { peer = "-" }
 	fmt.Printf("role=%s\n", c.Role)
 	fmt.Printf("mode=%s\n", c.Mode)
 	fmt.Printf("transport=%s\n", c.Transport.Type)
+	if c.Transport.Type == "ws" || c.Transport.Type == "wss" { fmt.Printf("websocket_path=%s\n", c.Transport.WebSocketPath) }
 	fmt.Printf("tun_name=%s\n", c.Tun.Name)
 	fmt.Printf("tun_cidr=%s\n", c.Tun.LocalCIDR)
 	fmt.Printf("tun_peer=%s\n", c.Tun.PeerIP)
@@ -133,86 +115,50 @@ func printConfigSummary(c *Config) {
 func run(c *Config) error {
 	log.Printf("Hashshashin %s starting role=%s mode=%s transport=%s smart-return=%t", version, c.Role, c.Mode, c.Transport.Type, c.SmartReturn.Enabled)
 	tun, err := openTun(c.Tun.Name)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	defer tun.Close()
 
 	cleanupSmartReturnPolicy(c)
 	cleanupRouting(c)
-	if err := setupTun(c); err != nil {
-		return err
-	}
-	if err := setupRouting(c); err != nil {
-		cleanupRouting(c)
-		return err
-	}
-	if err := setupSmartReturnPolicy(c); err != nil {
-		cleanupSmartReturnPolicy(c)
-		cleanupRouting(c)
-		return err
-	}
-	if err := setupCarrierFirewall(c); err != nil {
-		cleanupSmartReturnPolicy(c)
-		cleanupRouting(c)
-		return err
-	}
-	defer func() {
-		cleanupSmartReturnPolicy(c)
-		cleanupRouting(c)
-	}()
+	if err := setupTun(c); err != nil { return err }
+	if err := setupRouting(c); err != nil { cleanupRouting(c); return err }
+	if err := setupSmartReturnPolicy(c); err != nil { cleanupSmartReturnPolicy(c); cleanupRouting(c); return err }
+	if err := setupCarrierFirewall(c); err != nil { cleanupSmartReturnPolicy(c); cleanupRouting(c); return err }
+	defer func() { cleanupSmartReturnPolicy(c); cleanupRouting(c) }()
 
 	key, _ := base64.StdEncoding.DecodeString(c.Transport.Key)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	carrier, err := newCarrier(ctx, c)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	defer carrier.Close()
 	log.Printf("carrier=%s listen=%s peer=%s", carrier.Name(), c.Transport.Listen, c.Transport.Peer)
 
 	st := &tunnelState{hellos: make(map[[32]byte]helloRecord)}
-	if c.SmartReturn.Enabled {
-		st.initProbeAck()
-	}
+	if c.SmartReturn.Enabled { st.initProbeAck() }
 	go recvLoop(ctx, carrier, tun, key, st, c.Role)
 
 	if c.Role == "iran" {
 		go clientSupervisor(ctx, carrier, key, st, c)
-		if c.SmartReturn.Enabled {
-			go runDirectProbeResponder(ctx, c, key, carrier, st)
-		}
+		if c.SmartReturn.Enabled { go runDirectProbeResponder(ctx, c, key, carrier, st) }
 	} else {
 		go serverSupervisor(ctx, carrier, st, c)
-		if c.SmartReturn.Enabled {
-			go runDirectProbeMonitor(ctx, c, key, st)
-		}
+		if c.SmartReturn.Enabled { go runDirectProbeMonitor(ctx, c, key, st) }
 	}
 	go statsLoop(ctx, st)
 
-	go func() {
-		<-ctx.Done()
-		_ = carrier.Close()
-		_ = tun.Close()
-	}()
+	go func() { <-ctx.Done(); _ = carrier.Close(); _ = tun.Close() }()
 
 	buf := make([]byte, 65535)
 	for {
 		n, err := tun.Read(buf)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
+			if ctx.Err() != nil { return nil }
 			return fmt.Errorf("tun read: %w", err)
 		}
 		ss := st.loadSession()
-		if ss == nil {
-			continue
-		}
-		if err := sendEncrypted(carrier, ss, msgData, buf[:n]); err != nil {
-			log.Printf("%s send: %v", carrier.Name(), err)
-		}
+		if ss == nil { continue }
+		if err := sendEncrypted(carrier, ss, msgData, buf[:n]); err != nil { log.Printf("%s send: %v", carrier.Name(), err) }
 	}
 }
