@@ -33,6 +33,7 @@ yesno(){ local p="$1" d="$2" v; read -r -p "  $p [$d]: " v; v="${v:-$d}"; [[ "$v
 need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Installer را با root اجرا کنید."; }
 valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 )); }
 valid_ipv4(){ local IFS=. a b c d; [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1; read -r a b c d <<< "$1"; for n in "$a" "$b" "$c" "$d"; do (( n >= 0 && n <= 255 )) || return 1; done; }
+valid_ws_path(){ [[ "$1" =~ ^/[A-Za-z0-9._~/:-]+$ ]] && [[ ${#1} -le 128 ]]; }
 default_iface(){ ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}'; }
 default_gateway(){ ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="via"){print $(i+1);exit}}'; }
 default_src(){ ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}'; }
@@ -42,11 +43,11 @@ banner(){
   clear_screen
   printf '%b\n' "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}"
   printf '%b\n' "${CYAN}${BOLD}║${RESET}              ${WHITE}${BOLD}H A S H S H A S H I N${RESET}                     ${CYAN}${BOLD}║${RESET}"
-  printf '%b\n' "${CYAN}${BOLD}║${RESET}        ${GRAY}Adaptive L3 Tunnel • Smart Return${RESET}                 ${CYAN}${BOLD}║${RESET}"
+  printf '%b\n' "${CYAN}${BOLD}║${RESET}       ${GRAY}Adaptive L3 Tunnel • Multi-Transport${RESET}              ${CYAN}${BOLD}║${RESET}"
   printf '%b\n' "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
   printf '%b\n' "              ${PURPLE}حشاشین • نصب و مدیریت حرفه‌ای${RESET}"
   echo
-  printf '%b\n' "${GRAY} Full Tunnel • Direct Return • Auto Failover • UDP • TCP • KCP/FEC${RESET}"
+  printf '%b\n' "${GRAY} UDP • TCP • TLS 1.3 • KCP/FEC • WS • WSS • Smart Return${RESET}"
 }
 
 cleanup_on_error(){ local ec=$?; [[ $ec -eq 0 ]] && return; echo; warn "عملیات با کد $ec متوقف شد؛ Config قبلی خودکار حذف نشده است."; }
@@ -73,8 +74,7 @@ build_install(){
   go test ./...
   info "Building optimized binary..."
   go build -trimpath -ldflags="-s -w -X main.buildRef=$REF" -o "${BIN}.new" .
-  chmod 0755 "${BIN}.new"
-  mv "${BIN}.new" "$BIN"
+  chmod 0755 "${BIN}.new"; mv "${BIN}.new" "$BIN"
   install -d -m 0755 "$(dirname "$MANAGER")"
   install -m 0755 packaging/hashshashin-manager.sh "$MANAGER"
   install -m 0644 packaging/hashshashin.service "$SERVICE"
@@ -143,7 +143,7 @@ if [[ "$ACTION" == "--update" ]]; then
   ip link show hsh0 >/dev/null 2>&1 && ok "hsh0 is up." || warn "hsh0 not visible yet."
   [[ "$(sysctl -n net.ipv4.ip_forward)" == 1 ]] && ok "IPv4 forwarding enabled."
   step 6 8 "Feature compatibility"
-  "$BIN" -summary -c "$CONF" | grep -E '^(mode|transport|smart_return)=' || true
+  "$BIN" -summary -c "$CONF" | grep -E '^(mode|transport|websocket_path|smart_return)=' || true
   step 7 8 "Management"
   printf '%b\n' "  اجرا کنید: ${CYAN}${BOLD}hashshashin${RESET}"
   step 8 8 "Update complete"; ok "Hashshashin updated with existing Config."; exit 0
@@ -166,7 +166,7 @@ if [[ "$mode" == "direct-return" ]]; then
     smart=true
     probe_port="$(ask 'Direct-path health probe UDP port' '9001')"; valid_port "$probe_port" || die "Invalid probe port."
     printf '%b\n' "  ${GRAY}Default: هر 5 ثانیه probe؛ بعد از 3 خطا fallback و بعد از 3 موفقیت recovery.${RESET}"
-    if yesno 'Use default Smart Return sensitivity?' 'Y'; then :; else
+    if ! yesno 'Use default Smart Return sensitivity?' 'Y'; then
       probe_interval="$(ask 'Probe interval seconds' '5')"
       probe_timeout="$(ask 'Probe timeout seconds' '2')"
       fail_threshold="$(ask 'Failures before fallback' '3')"
@@ -176,15 +176,28 @@ if [[ "$mode" == "direct-return" ]]; then
 fi
 
 step 5 8 "Select carrier transport"
-printf '%b\n' "  ${CYAN}1) UDP${RESET}        ${GRAY}Lowest overhead${RESET}"
-printf '%b\n' "  ${BLUE}2) TCP${RESET}        ${GRAY}For UDP-restricted networks${RESET}"
-printf '%b\n' "  ${PURPLE}3) KCP/FEC${RESET}    ${GRAY}ARQ + optional loss recovery${RESET}"
+printf '%b\n' "  ${CYAN}1) UDP${RESET}          ${GRAY}کمترین سربار و latency${RESET}"
+printf '%b\n' "  ${BLUE}2) TCP${RESET}          ${GRAY}Stream ساده برای شبکه‌های محدودکننده UDP${RESET}"
+printf '%b\n' "  ${GREEN}3) TLS 1.3${RESET}      ${GRAY}TCP داخل outer TLS؛ HSH1 احراز هویت اصلی${RESET}"
+printf '%b\n' "  ${PURPLE}4) KCP/FEC${RESET}      ${GRAY}ARQ + FEC برای loss/jitter${RESET}"
+printf '%b\n' "  ${CYAN}5) WebSocket${RESET}    ${GRAY}RFC6455 binary frames روی TCP${RESET}"
+printf '%b\n' "  ${GREEN}6) WSS${RESET}          ${GRAY}WebSocket روی TLS 1.3${RESET}"
 transport_choice="$(ask 'Carrier' '1')"
-case "$transport_choice" in 2) transport="tcp";; 3) transport="kcp";; *) transport="udp";; esac
+case "$transport_choice" in
+  2) transport="tcp";; 3) transport="tls";; 4) transport="kcp";; 5) transport="ws";; 6) transport="wss";; *) transport="udp";;
+esac
+case "$transport" in tcp|tls|ws|wss) carrier_net="tcp";; *) carrier_net="udp";; esac
+websocket_path="/hsh"
+if [[ "$transport" == ws || "$transport" == wss ]]; then
+  websocket_path="$(ask 'WebSocket path' '/hsh')"; valid_ws_path "$websocket_path" || die "WebSocket path نامعتبر است. مثال: /hsh"
+fi
 kcp_data=0; kcp_parity=0; kcp_nodelay=1; kcp_interval=20; kcp_resend=2; kcp_nc=1; kcp_sndwnd=512; kcp_rcvwnd=512; kcp_mtu=1200; kcp_buffer=4194304
 if [[ "$transport" == kcp ]]; then
   printf '%b\n' "  ${GREEN}1) Balanced FEC 10/3${RESET}  ${CYAN}2) No FEC${RESET}  ${YELLOW}3) Strong FEC 10/5${RESET}"
   kp="$(ask 'KCP profile' '1')"; case "$kp" in 2) ;; 3) kcp_data=10; kcp_parity=5;; *) kcp_data=10; kcp_parity=3;; esac
+fi
+if [[ "$transport" == tls || "$transport" == wss ]]; then
+  printf '%b\n' "${GRAY}  Outer TLS از certificate کوتاه‌عمر self-signed استفاده می‌کند؛ peer authentication همچنان توسط HSH1/PSK انجام می‌شود.${RESET}"
 fi
 
 step 6 8 "Network & service configuration"
@@ -197,7 +210,7 @@ transport_port="$(ask "${transport^^} carrier port" '9000')"; valid_port "$trans
 ports_raw="$(ask 'Service ports (comma separated)' '443')"
 mtu="$(ask 'Tunnel MTU' '1320')"; [[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu >= 900 && mtu <= 1400 )) || die "MTU must be 900..1400."
 if [[ "$mode" == direct-return && "$role" == iran ]] && ! is_local_ip "$iface" "$local_ip"; then die "Direct Return requires Iran public IPv4 to be assigned on $iface; upstream NAT/CGNAT-only is not supported."; fi
-if [[ "$smart" == true && "$transport" != tcp && "$probe_port" == "$transport_port" ]]; then die "Smart probe UDP port must differ from UDP/KCP carrier port."; fi
+if [[ "$smart" == true && "$carrier_net" == udp && "$probe_port" == "$transport_port" ]]; then die "Smart probe UDP port must differ from UDP/KCP carrier port."; fi
 
 ports_json=""; IFS=',' read -r -a parr <<< "$ports_raw"
 for raw in "${parr[@]}"; do
@@ -214,7 +227,7 @@ if [[ "$role" == iran ]]; then
   foreign_ip="$(ask 'Kharej public IPv4' '')"; valid_ipv4 "$foreign_ip" || die "Invalid Kharej IPv4."
   iran_ip="$local_ip"; listen="0.0.0.0:$transport_port"; peer="$foreign_ip:$transport_port"; key="$($BIN -keygen)"; tun_cidr="10.77.0.1/30"; tun_peer="10.77.0.2"; lock=false
   echo; printf '%b\n' "${YELLOW}${BOLD}┌────────────── Shared Key ──────────────┐${RESET}"; printf '%b\n' "${WHITE}${BOLD}  $key${RESET}"; printf '%b\n' "${YELLOW}${BOLD}└─────────────────────────────────────────┘${RESET}"
-  printf '%b\n' "${GRAY}  Kharej باید دقیقاً همان Mode / Carrier / Port / Smart settings / Key را داشته باشد.${RESET}"
+  printf '%b\n' "${GRAY}  Kharej باید همان Mode / Carrier / Port / WS Path / Smart settings / Key را داشته باشد.${RESET}"
   read -r -p "  بعد از ذخیره کلید Enter بزنید... " _
 else
   iran_ip="$(ask 'Iran public IPv4' '')"; valid_ipv4 "$iran_ip" || die "Invalid Iran IPv4."
@@ -232,7 +245,7 @@ cat > "$CONF.tmp" <<JSON
   "role": "$role",
   "mode": "$mode",
   "transport": {
-    "type": "$transport", "listen": "$listen", "peer": "$peer", "key": "$key",
+    "type": "$transport", "listen": "$listen", "peer": "$peer", "key": "$key", "websocket_path": "$websocket_path",
     "keepalive_seconds": 5, "session_timeout_seconds": 25, "rekey_minutes": 30,
     "kcp": {"data_shards": $kcp_data, "parity_shards": $kcp_parity, "nodelay": $kcp_nodelay, "interval": $kcp_interval, "resend": $kcp_resend, "nc": $kcp_nc, "send_window": $kcp_sndwnd, "receive_window": $kcp_rcvwnd, "mtu": $kcp_mtu, "socket_buffer": $kcp_buffer}
   },
@@ -255,12 +268,13 @@ printf '%b\n' "${GREEN}${BOLD}║${RESET}                 ${WHITE}${BOLD}INSTALL
 printf '%b\n' "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
 printf '  Role          : %s\n  Mode          : %s\n  Carrier       : %s/%s\n  Service Ports : %s\n  TUN           : %s\n' "$role" "$mode" "${transport^^}" "$transport_port" "$ports_raw" "$tun_cidr"
 [[ "$transport" == kcp ]] && printf '  KCP FEC       : %s/%s\n' "$kcp_data" "$kcp_parity"
+[[ "$transport" == ws || "$transport" == wss ]] && printf '  WS Path       : %s\n' "$websocket_path"
 if [[ "$smart" == true ]]; then printf '  Smart Return  : ON (UDP probe %s, fail/recover %s/%s)\n' "$probe_port" "$fail_threshold" "$recover_threshold"; else printf '  Smart Return  : OFF\n'; fi
 
 echo
-[[ "$transport" == tcp ]] && printf '%b\n' "${GRAY}  Provider Firewall: TCP/${transport_port} فقط بین ایران و خارج.${RESET}" || printf '%b\n' "${GRAY}  Provider Firewall: UDP/${transport_port} فقط بین ایران و خارج.${RESET}"
-[[ "$smart" == true ]] && printf '%b\n' "${GRAY}  Smart Return: UDP/${probe_port} را از Kharej IP به Iran IP اجازه دهید.${RESET}"
+printf '%b\n' "${GRAY}  Provider Firewall: ${carrier_net^^}/${transport_port} فقط بین IP ایران و خارج.${RESET}"
+[[ "$smart" == true ]] && printf '%b\n' "${GRAY}  Smart Return: UDP/${probe_port} از Kharej IP به Iran IP مجاز باشد.${RESET}"
 printf '%b\n' "  مدیریت: ${CYAN}${BOLD}hashshashin${RESET}"
-if [[ "$role" == iran ]]; then printf '%b\n' "${YELLOW}${BOLD}  NEXT:${RESET} روی Kharej همان Mode/Carrier/Port/Smart settings/Shared Key را وارد کنید."; else printf '%b\n' "${GREEN}${BOLD}  NEXT:${RESET} Health Check را روی هر دو سرور اجرا کنید."; fi
+if [[ "$role" == iran ]]; then printf '%b\n' "${YELLOW}${BOLD}  NEXT:${RESET} روی Kharej همان Mode/Carrier/Port/WS Path/Smart settings/Shared Key را وارد کنید."; else printf '%b\n' "${GREEN}${BOLD}  NEXT:${RESET} Health Check را روی هر دو سرور اجرا کنید."; fi
 
 echo; if yesno 'Open Hashshashin Manager now?' 'Y'; then exec "$MANAGER"; fi
