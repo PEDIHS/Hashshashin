@@ -1,5 +1,5 @@
 name: گزارش باگ
-about: گزارش مشکل در Core، Routing، Installer یا Transport
+description: گزارش مشکل در Core، Routing، Installer یا Transport
 labels: []
 body:
   - type: markdown
