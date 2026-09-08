@@ -64,12 +64,13 @@ func wsClientHandshake(ctx context.Context, conn net.Conn, path, host string) (*
 	if err != nil {
 		return nil, fmt.Errorf("websocket response: %w", err)
 	}
-	if resp.Body != nil {
-		defer resp.Body.Close()
-	}
 	if resp.StatusCode != http.StatusSwitchingProtocols || !headerHasToken(resp.Header, "Upgrade", "websocket") || !headerHasToken(resp.Header, "Connection", "upgrade") {
+		if resp.Body != nil { _ = resp.Body.Close() }
 		return nil, fmt.Errorf("websocket upgrade rejected: %s", resp.Status)
 	}
+	// For HTTP 101, net/http may expose the upgraded socket through Body.
+	// Closing it here would close the WebSocket immediately, so ownership stays
+	// with wsPeer/conn after validation.
 	if resp.Header.Get("Sec-WebSocket-Accept") != websocketAccept(key) {
 		return nil, fmt.Errorf("websocket accept hash mismatch")
 	}
@@ -84,9 +85,7 @@ func wsServerHandshake(conn net.Conn, path string) (*wsPeer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("websocket request: %w", err)
 	}
-	if req.Body != nil {
-		defer req.Body.Close()
-	}
+	if req.Body != nil { _ = req.Body.Close() }
 	if req.Method != http.MethodGet || req.URL == nil || req.URL.Path != path {
 		return nil, fmt.Errorf("websocket request path/method rejected")
 	}
@@ -133,7 +132,6 @@ func (w *wsPeer) readBinary(buf []byte) (int, error) {
 		if control && (!fin || length > 125) {
 			return 0, fmt.Errorf("invalid websocket control frame")
 		}
-		// RFC6455: client-to-server frames are masked, server-to-client frames are not.
 		if (!w.client && !masked) || (w.client && masked) {
 			return 0, fmt.Errorf("invalid websocket masking direction")
 		}
@@ -150,16 +148,16 @@ func (w *wsPeer) readBinary(buf []byte) (int, error) {
 			for i := range payload { payload[i] ^= mask[i&3] }
 		}
 		switch opcode {
-		case 0x2: // binary
+		case 0x2:
 			if !fin { return 0, fmt.Errorf("fragmented websocket data frames are unsupported") }
 			return len(payload), nil
-		case 0x8: // close
+		case 0x8:
 			_ = w.writeFrame(0x8, payload)
 			return 0, io.EOF
-		case 0x9: // ping
+		case 0x9:
 			if err := w.writeFrame(0xA, payload); err != nil { return 0, err }
 			continue
-		case 0xA: // pong
+		case 0xA:
 			continue
 		default:
 			return 0, fmt.Errorf("unsupported websocket opcode 0x%x", opcode)
