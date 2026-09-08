@@ -1,116 +1,321 @@
+<div align="center">
+
 # حشاشین | Hashshashin
 
-**Hashshashin** یک تانل L3 مستقل برای Linux است که IP packet را از طریق TUN حمل می‌کند و برای سناریوی ایران ↔ خارج طراحی شده است.
+### تونل L3 مستقل برای Linux با Full Tunnel و Direct Return
 
-نسخه فعلی: **v0.1.0 — Initial Official Release (Beta)**
+**آپلود از تونل، دانلود مستقیم از خارج — بدون تغییر کانفیگ کاربر**
 
-دو حالت اصلی دارد:
+[![CI](https://github.com/PEDIHS/Hashshashin/actions/workflows/ci.yml/badge.svg)](https://github.com/PEDIHS/Hashshashin/actions/workflows/ci.yml)
+![Go](https://img.shields.io/badge/Go-1.18%2B-00ADD8?logo=go&logoColor=white)
+![Linux](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+![Release](https://img.shields.io/badge/Release-v0.1.0%20Beta-blue)
 
-- **Full Tunnel** — آپلود و دانلود هر دو از تونل عبور می‌کنند.
-- **Direct Return** — آپلود از ایران به خارج داخل تونل است، اما دانلود از سرور خارج مستقیماً از مسیر عادی اینترنت به ایران برمی‌گردد؛ کاربر همچنان به همان IP ایران متصل می‌شود و نیازی به تغییر کانفیگ ندارد.
+[راهنمای کامل فارسی](README_FA.md) · [English](README_EN.md) · [معماری](docs/ARCHITECTURE.md) · [امنیت](SECURITY.md) · [تغییرات نسخه‌ها](CHANGELOG.md)
 
-Hashshashin کپی سورس Paqet، Backhaul یا BackPack نیست. ایده‌های معماری عمومی آن‌ها — packet transport، L3/TUN و جداسازی data plane از carrier — به‌عنوان مرجع بررسی شده‌اند، اما هسته و wire protocol این پروژه مستقل پیاده‌سازی شده است.
+</div>
 
-## نصب سریع
+---
 
-روی **هر دو سرور** اجرا کنید:
+## حشاشین چیست؟
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh)
+**Hashshashin** یک تونل مستقل **Layer 3** برای Linux است که packetهای کامل IPv4 را از طریق interface نوع TUN با نام `hsh0` منتقل می‌کند.
+
+این پروژه به‌جای اینکه مثل یک port forwarder معمولی اتصال کاربر را terminate کند و در سمت خارج اتصال جدید بسازد، در سطح packet کار می‌کند. همین معماری امکان انتخاب مستقل مسیر رفت و برگشت را فراهم می‌کند.
+
+### دو حالت اصلی
+
+| حالت | آپلود | دانلود | Endpoint کاربر |
+|---|---|---|---|
+| **Full Tunnel** | از تونل | از تونل | سرور ایران |
+| **Direct Return** | از تونل | مستقیم خارج → ایران | سرور ایران |
+
+در حالت **Direct Return** کاربر همچنان به همان IP و Port ایران متصل می‌شود؛ اما مسیر دانلود می‌تواند از سرور خارج مستقیماً از اینترنت عادی به ایران برگردد و داخل carrier تونل عبور نکند.
+
+> **وضعیت پروژه:** نسخه `v0.1.0` یک **Official Beta** است. Core، رمزنگاری، reconnect/rekey، installer، build/vet و integration test داخل CI بررسی می‌شوند. رفتار TUN، policy routing و Direct Return همچنان به شبکه و Provider واقعی وابسته است و باید روی دو VPS واقعی verify شود.
+
+---
+
+## چرا Hashshashin؟
+
+هدف پروژه ساخت یک تونل صرفاً «دیگر» نیست. طراحی Hashshashin حول جداسازی **Data Plane** از **Carrier** انجام شده تا مسیر هر جهت بتواند مستقل مدیریت شود.
+
+مهم‌ترین تفاوت:
+
+```text
+روش معمول
+User -> Iran -> Tunnel -> Kharej
+User <- Iran <- Tunnel <- Kharej
+
+Hashshashin Direct Return
+User -> Iran -> Tunnel -> Kharej
+User <- Iran <---------- Kharej
+                 Direct
 ```
 
-ترتیب پیشنهادی:
+این یعنی در شبکه‌ای که مسیر مستقیم برگشت کیفیت بهتری دارد، دانلود مجبور نیست همان مسیر تونلی Upload را برگردد.
 
-1. ابتدا روی **Iran** نصب کنید؛ installer یک Shared Key تولید می‌کند.
-2. همان کلید را ذخیره کنید.
-3. روی **Kharej** installer را اجرا و همان Mode، Carrier Port، Service Ports و Shared Key را وارد کنید.
-4. سرویس ایران تا زمان بالا آمدن Kharej به‌صورت خودکار handshake را retry می‌کند.
+---
 
-### پیش‌نیاز مهم Direct Return
+## ویژگی‌های اصلی
 
-در حالت `direct-return`، **IP عمومی ایران باید واقعاً روی interface سرور ایران assign شده باشد**. سروری که فقط پشت CGNAT/NAT بالادستی است در v0.1 برای این حالت پشتیبانی نمی‌شود.
+- **L3/TUN واقعی** — حمل packet کامل IPv4 به‌جای proxy کردن sessionهای کاربر
+- **Full Tunnel** — مسیر رفت و برگشت داخل تونل
+- **Direct Return** — Upload داخل تونل و Download مستقیم از خارج
+- **بدون تغییر کانفیگ کاربر** — endpoint کاربر همان سرور ایران می‌ماند
+- **UDP Carrier احراز هویت‌شده و رمزنگاری‌شده**
+- **Shared Key با طول 256 بیت**
+- **HMAC-SHA256 handshake**
+- **AES-256-GCM payload encryption**
+- **کلیدهای مستقل TX و RX**
+- **nonce تصادفی Client/Server برای هر Session**
+- **Replay Protection با window 64 packet**
+- **تحمل UDP packet reordering**
+- **Keepalive و Reconnect خودکار**
+- **Rekey دوره‌ای**
+- **Policy Routing مجزا برای Data و Carrier**
+- **جلوگیری از Recursive Tunnel Loop**
+- **MTU قابل تنظیم**
+- **TCP MSS Clamp جهت‌دار**
+- **Chainهای اختصاصی iptables**
+- **عدم تغییر Global Firewall Policy به ACCEPT**
+- **Installer یک‌خطی**
+- **systemd service**
+- **Cleanup و Uninstall امن**
+- **CI روی Go 1.18 و Go 1.22**
+
+---
 
 ## معماری
 
 ### Full Tunnel
 
 ```text
-Client
-  |
-  v
-Iran Public IP
-  |
-  | DNAT + SNAT + policy routing
-  v
-hsh0 (Iran)
-  |
-  | Hashshashin authenticated UDP carrier
-  v
-hsh0 (Kharej)
-  |
-  v
-Service / Xray
-  |
-  v
-hsh0 (Kharej)
-  |
-  v
-hsh0 (Iran)
-  |
-  v
-Client
+                         Hashshashin encrypted carrier
+Client -> Iran -> hsh0  ==============================>  hsh0 -> Kharej Service
+Client <- Iran <- hsh0  <==============================  hsh0 <- Kharej Service
 ```
+
+در این حالت هر دو جهت از تونل عبور می‌کنند.
 
 ### Direct Return
 
 ```text
 UPLOAD
-Client -> Iran -> hsh0 ===== encrypted carrier =====> hsh0 -> Kharej Service
+Client -> Iran -> hsh0  ==============================>  hsh0 -> Kharej Service
 
 DOWNLOAD
-Client <- Iran <----------- normal Internet ----------- Kharej Service
+Client <- Iran  <--------------- Internet ---------------- Kharej Service
+                                Direct
 ```
 
-در Direct Return، conntrack روی ایران state اتصال را نگه می‌دارد و پاسخ مستقیم Kharej را reverse-NAT می‌کند؛ به همین دلیل endpoint کاربر همان IP/Port ایران باقی می‌ماند.
+روی ایران، `conntrack` و NAT وضعیت اتصال را نگه می‌دارند و packet برگشتی مستقیم را به همان connection کاربر map می‌کنند؛ بنابراین کاربر همچنان IP ایران را به‌عنوان endpoint می‌بیند.
 
-## Carrier و امنیت Transport
+جزئیات دقیق markها، tableها، TUN و NAT در این فایل آمده است:
 
-v0.1 از UDP به‌عنوان carrier اولیه استفاده می‌کند و روی آن این موارد را دارد:
+**[مشاهده معماری کامل](docs/ARCHITECTURE.md)**
 
-- Shared Key با طول 256 bit
-- HMAC-SHA256 برای handshake
-- client/server nonce تصادفی در هر session
-- کلید جداگانه برای TX و RX
-- AES-256-GCM برای payload
-- counter مستقل برای هر جهت
-- replay window با ظرفیت 64 packet برای تحمل UDP reordering
-- keepalive
-- reconnect خودکار
-- rekey دوره‌ای
+---
 
-> پروتکل هنوز audit امنیتی مستقل نشده است. برای محیط‌های حساس، قبل از استفاده گسترده security review توصیه می‌شود.
+# نصب سریع
 
-## Data-plane و جلوگیری از loop
+روی **هر دو سرور ایران و خارج** همین دستور را اجرا کنید:
 
-Hashshashin دو mark مجزا استفاده می‌کند:
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh)
+```
 
-- `0x66` برای user/data traffic
-- `0x77` برای outer carrier
+## ترتیب نصب پیشنهادی
 
-در Full Mode روی Kharej، carrier با table جداگانه `167` از interface عمومی خارج می‌شود تا route برگشت user traffic به `hsh0` باعث recursive tunnel نشود.
+### 1. ابتدا سرور ایران
+
+در Wizard انتخاب کنید:
+
+```text
+1) Iran (entry server)
+```
+
+سپس Mode:
+
+```text
+1) Full tunnel
+2) Direct return
+```
+
+Installer به‌صورت مرحله‌ای موارد زیر را دریافت می‌کند:
+
+- Public Interface
+- Public IPv4
+- Gateway
+- UDP Carrier Port
+- Service Ports
+- Tunnel MTU
+- IP سرور خارج
+
+بعد یک **Shared Key** ایجاد می‌کند.
+
+```text
+Shared key — copy this exact value to the Kharej installer:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+این کلید را ذخیره کنید.
+
+### 2. سپس سرور خارج
+
+دوباره همان دستور نصب را اجرا کنید:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh)
+```
+
+این بار انتخاب کنید:
+
+```text
+2) Kharej (service server)
+```
+
+موارد زیر باید با ایران یکسان باشند:
+
+- Mode
+- Carrier Port
+- Service Ports
+- Shared Key
+
+### 3. باز کردن Carrier در Firewall Provider
+
+اگر Cloud Firewall یا Security Group دارید، UDP Carrier را **فقط بین IP ایران و IP خارج** باز کنید.
+
+پیش‌فرض:
+
+```text
+Protocol: UDP
+Port: 9000
+Iran Public IP <-> Kharej Public IP
+```
+
+### 4. تنظیم Service روی خارج
+
+مثلاً اگر Xray / 3x-ui روی پورت `443` است، listener باید روی یکی از این‌ها باشد:
+
+```text
+0.0.0.0:443
+```
+
+یا:
+
+```text
+KHAREJ_PUBLIC_IP:443
+```
+
+این حالت مناسب نیست:
+
+```text
+127.0.0.1:443
+```
+
+چون packet ورودی از `hsh0` برای IP عمومی خارج destination می‌شود.
+
+برای آموزش کامل نصب:
+
+**[نصب مرحله‌به‌مرحله فارسی](docs/INSTALL_FA.md)**
+
+**[Step-by-step English Installation](docs/INSTALL_EN.md)**
+
+---
+
+## شرط مهم Direct Return
+
+در حالت Direct Return، IP عمومی ایران باید **واقعاً روی interface سرور ایران assign شده باشد**.
+
+بررسی:
+
+```bash
+ip -4 addr show
+```
+
+اگر سرور فقط IP خصوصی دارد و Public IP توسط NAT/CGNAT بالادستی ارائه می‌شود، Direct Return در نسخه فعلی پشتیبانی نمی‌شود.
+
+در این شرایط از **Full Tunnel** استفاده کنید.
+
+---
+
+## Data Plane و جلوگیری از Loop
+
+Hashshashin برای جلوگیری از loop بین carrier و tunnel دو routing domain جدا دارد.
+
+### User/Data Traffic
+
+```text
+fwmark: 0x66
+routing table: 166
+```
+
+### Outer Carrier
+
+```text
+fwmark: 0x77
+routing table: 167
+```
+
+در Full Tunnel اگر route برگشت user traffic به `hsh0` منتقل شود، carrier با mark جدا همچنان از interface اصلی سرور خارج می‌شود و داخل تونل خودش loop نمی‌زند.
+
+---
 
 ## MTU و MSS
 
-MTU پیش‌فرض `1320` است. installer اجازه مقدار `900..1400` را می‌دهد.
+مقدار پیش‌فرض MTU:
 
-- در Full Mode، MSS در مسیر tunnel محدود می‌شود.
-- در Direct Return، MSS سمت upload به‌صورت جهت‌دار clamp می‌شود تا download مستقیم بی‌جهت با MTU تونل محدود نشود.
+```text
+1320
+```
 
-برای شروع مقدار `1320` پیشنهاد می‌شود. اگر provider مسیر کم‌MTU دارد، `1280` یا `1240` را تست کنید.
+Installer بازه زیر را می‌پذیرد:
+
+```text
+900 - 1400
+```
+
+برای شروع `1320` پیشنهاد می‌شود.
+
+در صورت مشاهده fragmentation، stall یا رفتار نامناسب مسیر می‌توانید این مقادیر را تست کنید:
+
+```text
+1280
+1240
+```
+
+Hashshashin برای TCP از MSS Clamp استفاده می‌کند و در Direct Return این clamp به‌صورت جهت‌دار طراحی شده تا مسیر Download مستقیم بی‌دلیل به MTU مسیر Upload محدود نشود.
+
+---
+
+## امنیت Transport
+
+Transport نسخه فعلی شامل موارد زیر است:
+
+```text
+256-bit PSK
+HMAC-SHA256 authenticated handshake
+Fresh client/server nonces
+AES-256-GCM
+Separate TX/RX keys
+Packet counters
+Replay window
+Periodic rekey
+Keepalive
+Reconnect
+```
+
+> پروتکل هنوز Audit امنیتی مستقل خارجی نشده است. برای استفاده حساس یا deployment بزرگ، مطالعه `SECURITY.md` و review مستقل توصیه می‌شود.
+
+**[Security Policy](SECURITY.md)**
+
+---
 
 ## Firewall
 
-Hashshashin از chainهای اختصاصی iptables استفاده می‌کند و policy عمومی firewall را روی `ACCEPT` نمی‌گذارد.
+Hashshashin از chainهای اختصاصی استفاده می‌کند و policy اصلی فایروال سیستم را به `ACCEPT` تغییر نمی‌دهد.
 
 نمونه chainها:
 
@@ -125,46 +330,63 @@ HSH_MFWD
 HSH_MOUT
 ```
 
-روی Kharej installer می‌تواند دسترسی مستقیم Public به Service Portها را block کند و فقط traffic ورودی از `hsh0` را بپذیرد.
+در سمت خارج Installer می‌تواند دسترسی مستقیم Public به Service Portها را محدود کند.
 
-**Cloud Firewall / Security Group** خارج از کنترل Hashshashin است. Carrier UDP (پیش‌فرض `9000`) را بین IP ایران و خارج allow کنید.
-
-## سرویس مقصد روی Kharej
-
-سرویس مقصد، مثلاً Xray/3x-ui، باید روی یکی از این‌ها listen کند:
-
-```text
-0.0.0.0:<service-port>
-Kharej_Public_IP:<service-port>
-```
-
-اگر فقط روی `127.0.0.1` listen کند، packetهای ورودی از `hsh0` به IP عمومی Kharej به آن listener نمی‌رسند.
+---
 
 ## دستورات مدیریت
 
+### وضعیت سرویس
+
 ```bash
 systemctl status hashshashin
-systemctl restart hashshashin
+```
+
+### لاگ زنده
+
+```bash
 journalctl -u hashshashin -f
-hashshashin -version
+```
+
+### Restart
+
+```bash
+systemctl restart hashshashin
+```
+
+### بررسی Config
+
+```bash
 hashshashin -check -c /etc/hashshashin/config.json
 ```
 
-پاک‌سازی ruleهای Hashshashin بدون حذف برنامه:
+### نمایش نسخه
+
+```bash
+hashshashin -version
+```
+
+### پاک‌سازی Ruleهای شبکه
 
 ```bash
 hashshashin -cleanup -c /etc/hashshashin/config.json
 ```
 
-حذف برنامه:
+### Uninstall
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh) --uninstall
 ```
 
-installer فایل `/etc/hashshashin/config.json` را هنگام uninstall نگه می‌دارد تا Shared Key و تنظیمات ناخواسته از بین نرود.
+فایل زیر هنگام uninstall نگه داشته می‌شود تا Shared Key و تنظیمات تصادفی از بین نرود:
 
-## تست صحت مسیر
+```text
+/etc/hashshashin/config.json
+```
+
+---
+
+## تست صحت نصب
 
 روی ایران:
 
@@ -173,52 +395,142 @@ ip addr show hsh0
 ip rule show
 ip route show table 166
 iptables -t nat -S | grep HSH
-journalctl -u hashshashin -n 50 --no-pager
+journalctl -u hashshashin -n 100 --no-pager
 ```
 
-روی Kharej:
+روی خارج:
 
 ```bash
 ip addr show hsh0
-journalctl -u hashshashin -n 50 --no-pager
 ss -lntup
+journalctl -u hashshashin -n 100 --no-pager
 ```
 
-برای Direct Return با `tcpdump` باید الگوی کلی این باشد:
+در Direct Return انتظار کلی این است:
 
 ```text
-Iran hsh0:      upload application packets
-Kharej hsh0:    upload application packets
-Kharej public:  download application packets
-Iran public:    download application packets
+Iran hsh0       -> Upload application packets
+Kharej hsh0     -> Upload application packets
+Kharej Public   -> Download application packets
+Iran Public     -> Download application packets
 ```
 
-جزئیات تست در [`docs/VERIFY_FA.md`](docs/VERIFY_FA.md) آمده است.
+**[راهنمای Verify روی دو VPS](docs/VERIFY_FA.md)**
 
-## سیستم‌های هدف v0.1
+---
 
-- Linux IPv4
-- Ubuntu / Debian با TUN فعال
-- RHEL-compatible با `dnf` به‌صورت best-effort
-- `iptables` / `iproute2`
-- Go 1.18+ برای build از source
+## CI و تست‌های پروژه
 
-## محدودیت‌های v0.1
+GitHub Actions روی Go `1.18` و `1.22` این موارد را اجرا می‌کند:
+
+- Unit Tests
+- Race Detector
+- UDP Transport Integration Test
+- Authenticated Handshake Test
+- Directional Key Validation
+- Encrypted Payload Delivery Test
+- `go vet`
+- `go build`
+- Shell Syntax Check برای Installer
+
+سبز بودن CI تضمین‌کننده رفتار همه دیتاسنترها نیست؛ چون TUN، route، firewall و Direct Return به infrastructure واقعی وابسته‌اند.
+
+---
+
+## Roadmap
+
+- [x] L3 / TUN Core
+- [x] Full Tunnel
+- [x] Direct Return
+- [x] UDP Encrypted Carrier
+- [x] Keepalive
+- [x] Reconnect
+- [x] Periodic Rekey
+- [x] Replay Protection
+- [x] Data/Carrier Routing Isolation
+- [x] Installer یک‌خطی
+- [x] systemd integration
+- [x] CI چندنسخه Go
+- [ ] Direct Return Health Monitor
+- [ ] Automatic Direct → Tunnel Failover
+- [ ] Multipath
+- [ ] Raw/KCP-style Carrier
+- [ ] IPv6
+- [ ] Binary Releases
+- [ ] Debian/RPM Packages
+- [ ] External Security Audit
+- [ ] Multi-provider Benchmark
+
+---
+
+## محدودیت‌های نسخه فعلی
 
 - IPv6 هنوز پیاده‌سازی نشده است.
-- carrier فعلی UDP است؛ Raw/KCP و multipath در roadmap هستند.
-- automatic Direct→Tunnel quality failover هنوز در v0.1 فعال نیست؛ mode به‌صورت explicit انتخاب می‌شود.
-- Direct Return روی NAT/CGNAT ایران پشتیبانی نمی‌شود.
-- رفتار providerها و anti-spoofing/security-groupها متفاوت است؛ تست واقعی دو VPS ضروری است.
+- Carrier فعلی UDP است.
+- Raw/KCP هنوز اضافه نشده است.
+- Multipath هنوز اضافه نشده است.
+- Failover خودکار Direct → Tunnel هنوز فعال نیست.
+- Direct Return روی ایران پشت CGNAT/NAT بالادستی پشتیبانی نمی‌شود.
+- رفتار Providerها می‌تواند متفاوت باشد.
 
-## مستندات
+---
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [تست و Verify](docs/VERIFY_FA.md)
-- [Troubleshooting فارسی](docs/TROUBLESHOOTING_FA.md)
-- [Security Policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
+## مستندات پروژه
+
+| مستند | توضیح |
+|---|---|
+| [README_FA.md](README_FA.md) | راهنمای کامل فارسی |
+| [README_EN.md](README_EN.md) | راهنمای کامل انگلیسی |
+| [docs/INSTALL_FA.md](docs/INSTALL_FA.md) | نصب مرحله‌به‌مرحله فارسی |
+| [docs/INSTALL_EN.md](docs/INSTALL_EN.md) | نصب مرحله‌به‌مرحله انگلیسی |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | معماری L3، TUN، NAT و Routing |
+| [docs/VERIFY_FA.md](docs/VERIFY_FA.md) | تست مسیر واقعی دو سرور |
+| [docs/TROUBLESHOOTING_FA.md](docs/TROUBLESHOOTING_FA.md) | عیب‌یابی فارسی |
+| [SECURITY.md](SECURITY.md) | سیاست امنیت و نکات Deployment |
+| [CHANGELOG.md](CHANGELOG.md) | تاریخچه تغییرات |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | راهنمای مشارکت |
+
+---
+
+## استقلال پروژه
+
+Hashshashin کپی سورس **Paqet، Backhaul یا BackPack** نیست.
+
+ایده‌های عمومی معماری مانند:
+
+- Packet Transport
+- TUN / L3
+- Data Plane / Carrier Separation
+- Routing Isolation
+
+به‌عنوان مرجع فنی بررسی شده‌اند، اما Core و Wire Protocol این پروژه به‌صورت مستقل پیاده‌سازی شده‌اند.
+
+---
+
+## مشارکت در توسعه
+
+Issue و Pull Request برای بهبود Core، Routing، Transport، Installer و Documentation پذیرفته می‌شود.
+
+قبل از تغییر بخش‌های حساس پروتکل یا Routing، این فایل را مطالعه کنید:
+
+**[CONTRIBUTING.md](CONTRIBUTING.md)**
+
+---
 
 ## License
 
-MIT — فایل [`LICENSE`](LICENSE) را ببینید.
+Hashshashin تحت مجوز **MIT** منتشر شده است.
+
+[مشاهده LICENSE](LICENSE)
+
+---
+
+<div align="center">
+
+### حشاشین
+
+**کنترل مسیر Data Plane، بدون وابستگی به مسیر برگشت تونل**
+
+[راهنمای فارسی](README_FA.md) · [English Documentation](README_EN.md)
+
+</div>

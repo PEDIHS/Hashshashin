@@ -1,0 +1,37 @@
+name: پیشنهاد قابلیت
+description: پیشنهاد برای Core، Carrier، Routing، Installer یا Documentation
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: مسئله یا نیاز
+      description: این قابلیت چه مشکلی را حل می‌کند؟
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: پیشنهاد
+      description: معماری یا رفتار پیشنهادی را توضیح دهید.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: بخش مرتبط
+      options:
+        - Core / L3
+        - Routing / Direct Return
+        - Transport / Carrier
+        - Security / Crypto
+        - Installer / Packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: ریسک‌ها و Trade-offها
+      description: اگر روی MTU، امنیت، performance، compatibility یا routing اثر دارد توضیح دهید.

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: مستندات فارسی
+    url: https://github.com/PEDIHS/Hashshashin/blob/main/README_FA.md
+    about: قبل از ثبت Issue، راهنمای فارسی و Troubleshooting را بررسی کنید.
+  - name: Security Policy
+    url: https://github.com/PEDIHS/Hashshashin/security/policy
+    about: برای مشکلات امنیتی ابتدا Security Policy را مطالعه کنید.
