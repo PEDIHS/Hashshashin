@@ -6,11 +6,11 @@ import (
 	"strconv"
 )
 
-// setupCarrierFirewall aligns the host INPUT rule with the selected carrier.
-// Older v0.1 configs always installed an UDP carrier rule; when a node is
-// reconfigured to TCP this function removes the stale rule before inserting
-// the correct one. The HSH_INPUT chain is owned by Hashshashin and is removed
-// by cleanupRouting.
+// setupCarrierFirewall aligns INPUT rules with the selected carrier and role.
+// UDP/KCP use the configured local port on both nodes. TCP is asymmetric at
+// the socket layer: Iran dials, Kharej listens. Therefore Iran accepts only
+// ESTABLISHED replies from the Kharej carrier source port instead of exposing
+// the carrier destination port locally.
 func setupCarrierFirewall(c *Config) error {
 	if c.Network.PublicInterface == "" || c.Network.PublicIP == "" {
 		return nil
@@ -34,41 +34,34 @@ func setupCarrierFirewall(c *Config) error {
 		}
 	}
 
-	selected := transportNetwork(c.Transport.Type)
-	for _, proto := range []string{"udp", "tcp"} {
-		if proto == selected {
-			continue
-		}
-		for exec.Command("iptables", "-t", "filter", "-C", "HSH_INPUT",
+	var args []string
+	if c.Transport.Type == "tcp" && c.Role == "iran" {
+		args = []string{
 			"-i", c.Network.PublicInterface,
 			"-d", c.Network.PublicIP,
 			"-s", sourceIP,
-			"-p", proto,
+			"-p", "tcp",
+			"--sport", strconv.Itoa(port),
+			"-m", "conntrack", "--ctstate", "ESTABLISHED",
+			"-j", "ACCEPT",
+		}
+	} else {
+		selected := transportNetwork(c.Transport.Type)
+		args = []string{
+			"-i", c.Network.PublicInterface,
+			"-d", c.Network.PublicIP,
+			"-s", sourceIP,
+			"-p", selected,
 			"--dport", strconv.Itoa(port),
-			"-j", "ACCEPT").Run() == nil {
-			runQuiet("iptables", "-t", "filter", "-D", "HSH_INPUT",
-				"-i", c.Network.PublicInterface,
-				"-d", c.Network.PublicIP,
-				"-s", sourceIP,
-				"-p", proto,
-				"--dport", strconv.Itoa(port),
-				"-j", "ACCEPT")
+			"-j", "ACCEPT",
 		}
 	}
 
-	args := []string{
-		"-i", c.Network.PublicInterface,
-		"-d", c.Network.PublicIP,
-		"-s", sourceIP,
-		"-p", selected,
-		"--dport", strconv.Itoa(port),
-		"-j", "ACCEPT",
-	}
 	if exec.Command("iptables", append([]string{"-t", "filter", "-C", "HSH_INPUT"}, args...)...).Run() == nil {
 		return nil
 	}
 	if err := ipt("filter", append([]string{"-I", "HSH_INPUT", "1"}, args...)...); err != nil {
-		return fmt.Errorf("install %s carrier firewall rule: %w", selected, err)
+		return fmt.Errorf("install %s carrier firewall rule: %w", c.Transport.Type, err)
 	}
 	return nil
 }
