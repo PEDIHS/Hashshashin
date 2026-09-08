@@ -37,6 +37,7 @@ func headerHasToken(h http.Header, name, token string) bool {
 				return true
 			}
 		}
+	}
 	return false
 }
 
@@ -68,9 +69,6 @@ func wsClientHandshake(ctx context.Context, conn net.Conn, path, host string) (*
 		if resp.Body != nil { _ = resp.Body.Close() }
 		return nil, fmt.Errorf("websocket upgrade rejected: %s", resp.Status)
 	}
-	// For HTTP 101, net/http may expose the upgraded socket through Body.
-	// Closing it here would close the WebSocket immediately, so ownership stays
-	// with wsPeer/conn after validation.
 	if resp.Header.Get("Sec-WebSocket-Accept") != websocketAccept(key) {
 		return nil, fmt.Errorf("websocket accept hash mismatch")
 	}
