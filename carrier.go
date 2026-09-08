@@ -28,18 +28,26 @@ func newCarrier(ctx context.Context, c *Config) (packetCarrier, error) {
 		return newUDPCarrier(ctx, c)
 	case "tcp":
 		return newTCPCarrier(ctx, c)
+	case "tls":
+		return newTLSCarrier(ctx, c)
 	case "kcp":
 		return newKCPCarrier(ctx, c)
+	case "ws":
+		return newWebSocketCarrier(ctx, c, false)
+	case "wss":
+		return newWebSocketCarrier(ctx, c, true)
 	default:
 		return nil, fmt.Errorf("unsupported transport type %q", c.Transport.Type)
 	}
 }
 
 func transportNetwork(t string) string {
-	if t == "tcp" {
+	switch t {
+	case "tcp", "tls", "ws", "wss":
 		return "tcp"
+	default:
+		return "udp"
 	}
-	return "udp"
 }
 
 func socketMarkControl(network, address string, rc syscall.RawConn) error {
@@ -96,7 +104,7 @@ type streamCarrier struct {
 	defaultID string
 }
 
-func (s *streamCarrier) Name() string        { return s.name }
+func (s *streamCarrier) Name() string         { return s.name }
 func (s *streamCarrier) DefaultPeer() string { return s.defaultID }
 
 func (s *streamCarrier) ensureConn() (net.Conn, error) {
