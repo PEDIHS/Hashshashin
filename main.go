@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,13 +18,11 @@ import (
 var buildRef = "source"
 
 const (
-	version     = "0.1.0"
+	version     = "0.2.0-alpha"
 	managerPath = "/usr/local/libexec/hashshashin-manager"
 )
 
 func main() {
-	// `hashshashin` with no arguments is the operator-facing management panel.
-	// The systemd unit always passes -c, so daemon startup remains unambiguous.
 	if len(os.Args) == 1 {
 		if err := launchManager(); err != nil {
 			log.Fatal(err)
@@ -70,7 +67,7 @@ func main() {
 		return
 	}
 	if *check {
-		fmt.Printf("Hashshashin %s: config ok\n", version)
+		fmt.Printf("Hashshashin %s: config ok (transport=%s)\n", version, cfg.Transport.Type)
 		return
 	}
 	if os.Geteuid() != 0 {
@@ -107,6 +104,7 @@ func printConfigSummary(c *Config) {
 	}
 	fmt.Printf("role=%s\n", c.Role)
 	fmt.Printf("mode=%s\n", c.Mode)
+	fmt.Printf("transport=%s\n", c.Transport.Type)
 	fmt.Printf("tun_name=%s\n", c.Tun.Name)
 	fmt.Printf("tun_cidr=%s\n", c.Tun.LocalCIDR)
 	fmt.Printf("tun_peer=%s\n", c.Tun.PeerIP)
@@ -118,10 +116,14 @@ func printConfigSummary(c *Config) {
 	fmt.Printf("carrier_listen=%s\n", c.Transport.Listen)
 	fmt.Printf("carrier_peer=%s\n", peer)
 	fmt.Printf("service_ports=%s\n", strings.Join(ports, ","))
+	if c.Transport.Type == "kcp" {
+		fmt.Printf("kcp_fec=%d/%d\n", c.Transport.KCP.DataShards, c.Transport.KCP.ParityShards)
+		fmt.Printf("kcp_window=%d/%d\n", c.Transport.KCP.SendWindow, c.Transport.KCP.ReceiveWindow)
+	}
 }
 
 func run(c *Config) error {
-	log.Printf("Hashshashin %s starting role=%s mode=%s", version, c.Role, c.Mode)
+	log.Printf("Hashshashin %s starting role=%s mode=%s transport=%s", version, c.Role, c.Mode, c.Transport.Type)
 	tun, err := openTun(c.Tun.Name)
 	if err != nil {
 		return err
@@ -136,35 +138,36 @@ func run(c *Config) error {
 		cleanupRouting(c)
 		return err
 	}
+	if err := setupCarrierFirewall(c); err != nil {
+		cleanupRouting(c)
+		return err
+	}
 	defer cleanupRouting(c)
 
 	key, _ := base64.StdEncoding.DecodeString(c.Transport.Key)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	udp, err := listenMarkedUDP(ctx, c.Transport.Listen)
+	carrier, err := newCarrier(ctx, c)
 	if err != nil {
 		return err
 	}
-	defer udp.Close()
+	defer carrier.Close()
+	log.Printf("carrier=%s listen=%s peer=%s", carrier.Name(), c.Transport.Listen, c.Transport.Peer)
 
 	st := &tunnelState{hellos: make(map[[32]byte]helloRecord)}
-	go recvLoop(ctx, udp, tun, key, st, c.Role)
+	go recvLoop(ctx, carrier, tun, key, st, c.Role)
 
 	if c.Role == "iran" {
-		peer, err := net.ResolveUDPAddr("udp4", c.Transport.Peer)
-		if err != nil {
-			return err
-		}
-		go clientSupervisor(ctx, udp, peer, key, st, c)
+		go clientSupervisor(ctx, carrier, key, st, c)
 	} else {
-		go serverSupervisor(ctx, udp, st, c)
+		go serverSupervisor(ctx, carrier, st, c)
 	}
 	go statsLoop(ctx, st)
 
 	go func() {
 		<-ctx.Done()
-		_ = udp.Close()
+		_ = carrier.Close()
 		_ = tun.Close()
 	}()
 
@@ -181,8 +184,8 @@ func run(c *Config) error {
 		if ss == nil {
 			continue
 		}
-		if err := sendEncrypted(udp, ss, msgData, buf[:n]); err != nil {
-			log.Printf("transport send: %v", err)
+		if err := sendEncrypted(carrier, ss, msgData, buf[:n]); err != nil {
+			log.Printf("%s send: %v", carrier.Name(), err)
 		}
 	}
 }
