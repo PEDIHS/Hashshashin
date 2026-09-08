@@ -2,15 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main, 'dev/**']
+    branches: [ main, 'dev/**', 'feat/**' ]
   pull_request:
-
-permissions:
-  contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         go: ['1.18.x', '1.22.x']
@@ -19,12 +16,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
-          cache: false
       - name: Unit and transport integration tests
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
       - name: Build
-        run: go build -trimpath -ldflags='-s -w -X main.buildRef=ci' ./...
+        run: go build -trimpath ./...
       - name: Installer syntax
         run: bash -n install.sh
+      - name: Manager syntax
+        run: bash -n packaging/hashshashin-manager.sh
