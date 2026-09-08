@@ -74,6 +74,7 @@ func main() {
 		log.Fatal("Hashshashin must run as root")
 	}
 	if *cleanup {
+		cleanupSmartReturnPolicy(cfg)
 		cleanupRouting(cfg)
 		return
 	}
@@ -119,6 +120,8 @@ func printConfigSummary(c *Config) {
 	fmt.Printf("smart_return=%t\n", c.SmartReturn.Enabled)
 	if c.SmartReturn.Enabled {
 		fmt.Printf("smart_probe_port=%d\n", c.SmartReturn.ProbePort)
+		fmt.Printf("smart_interval=%d\n", c.SmartReturn.IntervalSeconds)
+		fmt.Printf("smart_timeout=%d\n", c.SmartReturn.TimeoutSeconds)
 		fmt.Printf("smart_thresholds=%d/%d\n", c.SmartReturn.FailThreshold, c.SmartReturn.RecoverThreshold)
 	}
 	if c.Transport.Type == "kcp" {
@@ -135,6 +138,7 @@ func run(c *Config) error {
 	}
 	defer tun.Close()
 
+	cleanupSmartReturnPolicy(c)
 	cleanupRouting(c)
 	if err := setupTun(c); err != nil {
 		return err
@@ -143,11 +147,20 @@ func run(c *Config) error {
 		cleanupRouting(c)
 		return err
 	}
-	if err := setupCarrierFirewall(c); err != nil {
+	if err := setupSmartReturnPolicy(c); err != nil {
+		cleanupSmartReturnPolicy(c)
 		cleanupRouting(c)
 		return err
 	}
-	defer cleanupRouting(c)
+	if err := setupCarrierFirewall(c); err != nil {
+		cleanupSmartReturnPolicy(c)
+		cleanupRouting(c)
+		return err
+	}
+	defer func() {
+		cleanupSmartReturnPolicy(c)
+		cleanupRouting(c)
+	}()
 
 	key, _ := base64.StdEncoding.DecodeString(c.Transport.Key)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
