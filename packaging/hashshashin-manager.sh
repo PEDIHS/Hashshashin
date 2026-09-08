@@ -26,22 +26,23 @@ fi
 banner(){
   printf '%b\n' "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}"
   printf '%b\n' "${CYAN}${BOLD}║${RESET}              ${WHITE}${BOLD}H A S H S H A S H I N${RESET}                     ${CYAN}${BOLD}║${RESET}"
-  printf '%b\n' "${CYAN}${BOLD}║${RESET}       ${GRAY}Adaptive L3 Tunnel • Smart Path Manager${RESET}             ${CYAN}${BOLD}║${RESET}"
+  printf '%b\n' "${CYAN}${BOLD}║${RESET}      ${GRAY}Multi-Transport L3 • Smart Path Manager${RESET}             ${CYAN}${BOLD}║${RESET}"
   printf '%b\n' "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
-  printf '%b\n' "              ${PURPLE}حشاشین • پنل مدیریت تونل${RESET}"
+  printf '%b\n' "          ${PURPLE}UDP • TCP • TLS • KCP • WS • WSS • Smart Return${RESET}"
 }
 
-role="-"; mode="-"; transport="udp"; tun_name="hsh0"; tun_cidr="-"; tun_peer="-"; mtu="-"
+role="-"; mode="-"; transport="udp"; websocket_path="-"; tun_name="hsh0"; tun_cidr="-"; tun_peer="-"; mtu="-"
 public_interface="-"; public_ip="-"; foreign_public_ip="-"; iran_public_ip="-"
 carrier_listen="-"; carrier_peer="-"; service_ports="-"; kcp_fec="-"; kcp_window="-"
 smart_return="false"; smart_probe_port="-"; smart_interval="-"; smart_timeout="-"; smart_thresholds="-"
 
 load_summary(){
-  role="-"; mode="-"; transport="udp"; tun_name="hsh0"; mtu="-"; smart_return="false"; smart_probe_port="-"; smart_thresholds="-"
+  role="-"; mode="-"; transport="udp"; websocket_path="-"; tun_name="hsh0"; mtu="-"; smart_return="false"; smart_probe_port="-"; smart_thresholds="-"
   [[ -x "$BIN" && -f "$CONF" ]] || return 0
   while IFS='=' read -r k v; do
     case "$k" in
-      role) role="$v";; mode) mode="$v";; transport) transport="$v";; tun_name) tun_name="$v";; tun_cidr) tun_cidr="$v";; tun_peer) tun_peer="$v";; mtu) mtu="$v";;
+      role) role="$v";; mode) mode="$v";; transport) transport="$v";; websocket_path) websocket_path="$v";;
+      tun_name) tun_name="$v";; tun_cidr) tun_cidr="$v";; tun_peer) tun_peer="$v";; mtu) mtu="$v";;
       public_interface) public_interface="$v";; public_ip) public_ip="$v";; foreign_public_ip) foreign_public_ip="$v";; iran_public_ip) iran_public_ip="$v";;
       carrier_listen) carrier_listen="$v";; carrier_peer) carrier_peer="$v";; service_ports) service_ports="$v";;
       kcp_fec) kcp_fec="$v";; kcp_window) kcp_window="$v";; smart_return) smart_return="$v";; smart_probe_port) smart_probe_port="$v";;
@@ -54,6 +55,7 @@ service_enabled(){ systemctl is-enabled "$SERVICE" 2>/dev/null || true; }
 role_label(){ [[ "$role" == iran ]] && echo "IRAN / Entry" || { [[ "$role" == kharej ]] && echo "KHAREJ / Exit" || echo "$role"; }; }
 mode_label(){ [[ "$mode" == full ]] && echo "Full Tunnel" || { [[ "$mode" == direct-return ]] && echo "Direct Return" || echo "$mode"; }; }
 transport_label(){ echo "${transport^^}"; }
+is_stream_carrier(){ case "$transport" in tcp|tls|ws|wss) return 0;; *) return 1;; esac; }
 human_bytes(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec-i --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0} B"; }
 iface_counter(){ local f="/sys/class/net/${tun_name}/statistics/$1"; [[ -r "$f" ]] && cat "$f" || echo 0; }
 state_badge(){ case "$1" in active) printf '%b' "${GREEN}● ACTIVE${RESET}";; failed) printf '%b' "${RED}● FAILED${RESET}";; *) printf '%b' "${YELLOW}● ${1^^}${RESET}";; esac; }
@@ -103,6 +105,7 @@ show_overview(){
   printf '  Role             : %s\n' "$(role_label)"
   printf '  Mode             : %s\n' "$(mode_label)"
   printf '  Carrier          : %s\n' "$(transport_label)"
+  [[ "$transport" == ws || "$transport" == wss ]] && printf '  WebSocket path   : %s\n' "$websocket_path"
   printf '  Public interface : %s\n' "$public_interface"
   printf '  Kharej / Iran IP : %s / %s\n' "$foreign_public_ip" "$iran_public_ip"
   printf '  TUN              : %s (%s -> %s)\n' "$tun_name" "$tun_cidr" "$tun_peer"
@@ -123,8 +126,12 @@ check_item(){ if [[ "$1" == 1 ]]; then printf '  %b %-29s %s\n' "${GREEN}✔${RE
 carrier_health(){
   local port="${carrier_listen##*:}"
   command -v ss >/dev/null 2>&1 || return 1
-  if [[ "$transport" == tcp ]]; then
-    if [[ "$role" == kharej ]]; then ss -H -ltn 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"; else ss -H -tn 2>/dev/null | grep -Eq "${foreign_public_ip}:${port}[[:space:]]"; fi
+  if is_stream_carrier; then
+    if [[ "$role" == kharej ]]; then
+      ss -H -ltn 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"
+    else
+      ss -H -tn 2>/dev/null | grep -Eq "${foreign_public_ip}:${port}[[:space:]]"
+    fi
   else
     ss -H -lun 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"
   fi
@@ -154,7 +161,7 @@ health_check(){
   [[ "$smart_return" == true ]] && check_item "$smartok" "Smart Return" "path=$(return_path) probe=UDP/${smart_probe_port}"
   echo
   if (( st && cfg && tun && fwd && carrier && routing && smartok )); then printf '%b\n' "  ${GREEN}${BOLD}Health: PASS${RESET}"; else printf '%b\n' "  ${YELLOW}${BOLD}Health: ATTENTION${RESET}"; fi
-  printf '%b\n' "  ${GRAY}این Health Check محلی است؛ تست end-to-end دو VPS همچنان لازم است.${RESET}"
+  printf '%b\n' "  ${GRAY}Health Check محلی است؛ verify دو VPS برای مسیر واقعی لازم است.${RESET}"
   pause
 }
 
