@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
@@ -64,24 +63,6 @@ func (r *returnPathController) observe(ok bool) (returnPath, bool) {
 		}
 	}
 	return r.path, false
-}
-
-func setKharejReturnPath(c *Config, path returnPath) error {
-	if c.Role != "kharej" || c.Mode != "direct-return" {
-		return nil
-	}
-	switch path {
-	case returnPathDirect:
-		runQuiet("ip", "route", "del", c.Network.IranPublicIP+"/32", "dev", c.Tun.Name)
-		return nil
-	case returnPathTunnel:
-		if err := runCmd("ip", "route", "replace", c.Network.IranPublicIP+"/32", "dev", c.Tun.Name); err != nil {
-			return fmt.Errorf("install tunnel return route: %w", err)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown return path %q", path)
-	}
 }
 
 func (s *tunnelState) initProbeAck() {
