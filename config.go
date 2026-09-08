@@ -15,16 +15,31 @@ type Port struct {
 	Protocol string `json:"protocol"`
 }
 
+type KCPConfig struct {
+	DataShards    int `json:"data_shards"`
+	ParityShards  int `json:"parity_shards"`
+	NoDelay       int `json:"nodelay"`
+	Interval      int `json:"interval"`
+	Resend        int `json:"resend"`
+	NoCongestion  int `json:"nc"`
+	SendWindow    int `json:"send_window"`
+	ReceiveWindow int `json:"receive_window"`
+	MTU           int `json:"mtu"`
+	SocketBuffer  int `json:"socket_buffer"`
+}
+
 type Config struct {
 	Role      string `json:"role"`
 	Mode      string `json:"mode"`
 	Transport struct {
-		Listen                string `json:"listen"`
-		Peer                  string `json:"peer"`
-		Key                   string `json:"key"`
-		KeepaliveSeconds      int    `json:"keepalive_seconds"`
-		SessionTimeoutSeconds int    `json:"session_timeout_seconds"`
-		RekeyMinutes          int    `json:"rekey_minutes"`
+		Type                  string    `json:"type"`
+		Listen                string    `json:"listen"`
+		Peer                  string    `json:"peer"`
+		Key                   string    `json:"key"`
+		KeepaliveSeconds      int       `json:"keepalive_seconds"`
+		SessionTimeoutSeconds int       `json:"session_timeout_seconds"`
+		RekeyMinutes          int       `json:"rekey_minutes"`
+		KCP                   KCPConfig `json:"kcp,omitempty"`
 	} `json:"transport"`
 	Tun struct {
 		Name      string `json:"name"`
@@ -62,6 +77,12 @@ func loadConfig(path string) (*Config, error) {
 	if c.Mode != "full" && c.Mode != "direct-return" {
 		return nil, errors.New("mode must be full or direct-return")
 	}
+	if c.Transport.Type == "" {
+		c.Transport.Type = "udp"
+	}
+	if c.Transport.Type != "udp" && c.Transport.Type != "tcp" && c.Transport.Type != "kcp" {
+		return nil, errors.New("transport.type must be udp, tcp or kcp")
+	}
 	if c.Tun.Name == "" {
 		c.Tun.Name = "hsh0"
 	}
@@ -93,18 +114,25 @@ func loadConfig(path string) (*Config, error) {
 		return nil, errors.New("rekey_minutes must be between 5 and 1440")
 	}
 
+	if c.Transport.Type == "kcp" {
+		applyKCPDefaults(&c.Transport.KCP)
+		if err := validateKCP(c.Transport.KCP); err != nil {
+			return nil, err
+		}
+	}
+
 	key, err := base64.StdEncoding.DecodeString(c.Transport.Key)
 	if err != nil || len(key) != 32 {
 		return nil, errors.New("transport.key must be base64 of exactly 32 bytes")
 	}
-	if _, err := net.ResolveUDPAddr("udp4", c.Transport.Listen); err != nil {
+	if err := validateTransportAddress(c.Transport.Type, c.Transport.Listen); err != nil {
 		return nil, fmt.Errorf("invalid transport.listen: %w", err)
 	}
 	if c.Role == "iran" {
 		if c.Transport.Peer == "" {
 			return nil, errors.New("transport.peer is required on iran")
 		}
-		if _, err := net.ResolveUDPAddr("udp4", c.Transport.Peer); err != nil {
+		if err := validateTransportAddress(c.Transport.Type, c.Transport.Peer); err != nil {
 			return nil, fmt.Errorf("invalid transport.peer: %w", err)
 		}
 	}
@@ -146,12 +174,82 @@ func loadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	carrierProto := transportNetwork(c.Transport.Type)
 	for _, p := range c.Ports {
-		if p.Port == carrierPort && (p.Protocol == "udp" || p.Protocol == "both") {
-			return nil, fmt.Errorf("UDP carrier port %d conflicts with service port %d/%s", carrierPort, p.Port, p.Protocol)
+		if p.Port == carrierPort && protocolIncludes(p.Protocol, carrierProto) {
+			return nil, fmt.Errorf("%s carrier port %d conflicts with service port %d/%s", c.Transport.Type, carrierPort, p.Port, p.Protocol)
 		}
 	}
 	return &c, nil
+}
+
+func applyKCPDefaults(k *KCPConfig) {
+	if k.NoDelay == 0 {
+		k.NoDelay = 1
+	}
+	if k.Interval == 0 {
+		k.Interval = 20
+	}
+	if k.Resend == 0 {
+		k.Resend = 2
+	}
+	if k.NoCongestion == 0 {
+		k.NoCongestion = 1
+	}
+	if k.SendWindow == 0 {
+		k.SendWindow = 512
+	}
+	if k.ReceiveWindow == 0 {
+		k.ReceiveWindow = 512
+	}
+	if k.MTU == 0 {
+		k.MTU = 1200
+	}
+	if k.SocketBuffer == 0 {
+		k.SocketBuffer = 4 * 1024 * 1024
+	}
+}
+
+func validateKCP(k KCPConfig) error {
+	if k.DataShards < 0 || k.DataShards > 255 || k.ParityShards < 0 || k.ParityShards > 255 {
+		return errors.New("kcp data_shards/parity_shards must be between 0 and 255")
+	}
+	if (k.DataShards == 0) != (k.ParityShards == 0) {
+		return errors.New("kcp FEC requires both data_shards and parity_shards, or both zero")
+	}
+	if k.NoDelay < 0 || k.NoDelay > 1 || k.NoCongestion < 0 || k.NoCongestion > 1 {
+		return errors.New("kcp nodelay and nc must be 0 or 1")
+	}
+	if k.Interval < 10 || k.Interval > 100 || k.Resend < 0 || k.Resend > 2 {
+		return errors.New("kcp interval must be 10..100 and resend 0..2")
+	}
+	if k.SendWindow < 32 || k.SendWindow > 8192 || k.ReceiveWindow < 32 || k.ReceiveWindow > 8192 {
+		return errors.New("kcp windows must be between 32 and 8192")
+	}
+	if k.MTU < 576 || k.MTU > 1400 {
+		return errors.New("kcp mtu must be between 576 and 1400")
+	}
+	if k.SocketBuffer < 256*1024 || k.SocketBuffer > 64*1024*1024 {
+		return errors.New("kcp socket_buffer must be between 256KiB and 64MiB")
+	}
+	return nil
+}
+
+func validateTransportAddress(kind, addr string) error {
+	switch kind {
+	case "tcp":
+		_, err := net.ResolveTCPAddr("tcp4", addr)
+		return err
+	case "udp", "kcp":
+		_, err := net.ResolveUDPAddr("udp4", addr)
+		return err
+	default:
+		return fmt.Errorf("unsupported transport %q", kind)
+	}
+}
+
+func protocolIncludes(serviceProto, carrierProto string) bool {
+	return serviceProto == "both" || serviceProto == carrierProto
 }
 
 func listenPort(addr string) (int, error) {
