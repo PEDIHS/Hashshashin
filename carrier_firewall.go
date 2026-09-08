@@ -7,10 +7,10 @@ import (
 )
 
 // setupCarrierFirewall aligns INPUT rules with the selected carrier and role.
-// UDP/KCP use the configured local port on both nodes. TCP is asymmetric at
-// the socket layer: Iran dials, Kharej listens. Therefore Iran accepts only
-// ESTABLISHED replies from the Kharej carrier source port instead of exposing
-// the carrier destination port locally.
+// UDP/KCP use the configured local UDP port on both nodes. TCP-underlay
+// carriers (TCP/TLS/WS/WSS) are asymmetric at the socket layer: Iran dials and
+// Kharej listens. Iran therefore accepts only ESTABLISHED replies instead of
+// exposing the carrier destination port locally.
 func setupCarrierFirewall(c *Config) error {
 	if c.Network.PublicInterface == "" || c.Network.PublicIP == "" {
 		return nil
@@ -34,8 +34,9 @@ func setupCarrierFirewall(c *Config) error {
 		}
 	}
 
+	selected := transportNetwork(c.Transport.Type)
 	var args []string
-	if c.Transport.Type == "tcp" && c.Role == "iran" {
+	if selected == "tcp" && c.Role == "iran" {
 		args = []string{
 			"-i", c.Network.PublicInterface,
 			"-d", c.Network.PublicIP,
@@ -46,7 +47,6 @@ func setupCarrierFirewall(c *Config) error {
 			"-j", "ACCEPT",
 		}
 	} else {
-		selected := transportNetwork(c.Transport.Type)
 		args = []string{
 			"-i", c.Network.PublicInterface,
 			"-d", c.Network.PublicIP,
