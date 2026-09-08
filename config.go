@@ -157,6 +157,9 @@ func loadConfig(path string) (*Config, error) {
 		if c.Mode != "direct-return" {
 			return nil, errors.New("smart_return can only be enabled in direct-return mode")
 		}
+		if len(c.Ports) == 0 {
+			return nil, errors.New("smart_return requires at least one service port")
+		}
 		applySmartReturnDefaults(&c.SmartReturn)
 		if err := validateSmartReturn(c.SmartReturn); err != nil {
 			return nil, err
