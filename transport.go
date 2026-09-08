@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	magic              = "HSH1"
-	msgHello      byte = 1
-	msgHelloAck   byte = 2
-	msgData       byte = 3
-	msgKeepalive  byte = 4
-	transportMark      = 0x77
+	magic                   = "HSH1"
+	msgHello           byte = 1
+	msgHelloAck        byte = 2
+	msgData            byte = 3
+	msgKeepalive       byte = 4
+	msgDirectProbeAck  byte = 5
+	transportMark           = 0x77
 )
 
 type helloRecord struct {
@@ -36,6 +37,8 @@ type tunnelState struct {
 	pendingSet bool
 	helloMu    sync.Mutex
 	hellos     map[[32]byte]helloRecord
+	probeMu    sync.Mutex
+	probeAck   chan [16]byte
 }
 
 func (s *tunnelState) loadSession() *session {
@@ -200,7 +203,7 @@ func recvLoop(ctx context.Context, carrier packetCarrier, tun io.Writer, key []b
 			if role == "iran" {
 				handleHelloAck(peer, b[:n], key, st)
 			}
-		case msgData, msgKeepalive:
+		case msgData, msgKeepalive, msgDirectProbeAck:
 			handleEncrypted(tun, peer, b[:n], st)
 		}
 	}
@@ -300,8 +303,17 @@ func handleEncrypted(tun io.Writer, peer string, p []byte, st *tunnelState) {
 	}
 	ss.touch()
 	atomic.AddUint64(&ss.rxBytes, uint64(len(plain)))
-	if p[4] == msgData && len(plain) > 0 {
-		_, _ = tun.Write(plain)
+	switch p[4] {
+	case msgData:
+		if len(plain) > 0 {
+			_, _ = tun.Write(plain)
+		}
+	case msgDirectProbeAck:
+		if len(plain) == 16 {
+			var probeNonce [16]byte
+			copy(probeNonce[:], plain)
+			st.notifyProbeAck(probeNonce)
+		}
 	}
 }
 
