@@ -28,6 +28,15 @@ type KCPConfig struct {
 	SocketBuffer  int `json:"socket_buffer"`
 }
 
+type SmartReturnConfig struct {
+	Enabled          bool `json:"enabled"`
+	ProbePort        int  `json:"probe_port"`
+	IntervalSeconds  int  `json:"interval_seconds"`
+	TimeoutSeconds   int  `json:"timeout_seconds"`
+	FailThreshold    int  `json:"fail_threshold"`
+	RecoverThreshold int  `json:"recover_threshold"`
+}
+
 type Config struct {
 	Role      string `json:"role"`
 	Mode      string `json:"mode"`
@@ -41,7 +50,8 @@ type Config struct {
 		RekeyMinutes          int       `json:"rekey_minutes"`
 		KCP                   KCPConfig `json:"kcp,omitempty"`
 	} `json:"transport"`
-	Tun struct {
+	SmartReturn SmartReturnConfig `json:"smart_return,omitempty"`
+	Tun         struct {
 		Name      string `json:"name"`
 		LocalCIDR string `json:"local_cidr"`
 		PeerIP    string `json:"peer_ip"`
@@ -143,6 +153,19 @@ func loadConfig(path string) (*Config, error) {
 		return nil, errors.New("invalid tun.peer_ip")
 	}
 
+	if c.SmartReturn.Enabled {
+		if c.Mode != "direct-return" {
+			return nil, errors.New("smart_return can only be enabled in direct-return mode")
+		}
+		if len(c.Ports) == 0 {
+			return nil, errors.New("smart_return requires at least one service port")
+		}
+		applySmartReturnDefaults(&c.SmartReturn)
+		if err := validateSmartReturn(c.SmartReturn); err != nil {
+			return nil, err
+		}
+	}
+
 	if len(c.Ports) == 0 {
 		return &c, nil
 	}
@@ -179,8 +202,48 @@ func loadConfig(path string) (*Config, error) {
 		if p.Port == carrierPort && protocolIncludes(p.Protocol, carrierProto) {
 			return nil, fmt.Errorf("%s carrier port %d conflicts with service port %d/%s", c.Transport.Type, carrierPort, p.Port, p.Protocol)
 		}
+		if c.SmartReturn.Enabled && p.Port == c.SmartReturn.ProbePort && (p.Protocol == "udp" || p.Protocol == "both") {
+			return nil, fmt.Errorf("smart_return probe port %d conflicts with service port %d/%s", c.SmartReturn.ProbePort, p.Port, p.Protocol)
+		}
+	}
+	if c.SmartReturn.Enabled && carrierProto == "udp" && carrierPort == c.SmartReturn.ProbePort {
+		return nil, errors.New("smart_return probe_port must differ from UDP/KCP carrier port")
 	}
 	return &c, nil
+}
+
+func applySmartReturnDefaults(s *SmartReturnConfig) {
+	if s.ProbePort == 0 {
+		s.ProbePort = 9001
+	}
+	if s.IntervalSeconds == 0 {
+		s.IntervalSeconds = 5
+	}
+	if s.TimeoutSeconds == 0 {
+		s.TimeoutSeconds = 2
+	}
+	if s.FailThreshold == 0 {
+		s.FailThreshold = 3
+	}
+	if s.RecoverThreshold == 0 {
+		s.RecoverThreshold = 3
+	}
+}
+
+func validateSmartReturn(s SmartReturnConfig) error {
+	if s.ProbePort < 1 || s.ProbePort > 65535 {
+		return errors.New("smart_return.probe_port must be 1..65535")
+	}
+	if s.IntervalSeconds < 2 || s.IntervalSeconds > 300 {
+		return errors.New("smart_return.interval_seconds must be 2..300")
+	}
+	if s.TimeoutSeconds < 1 || s.TimeoutSeconds >= s.IntervalSeconds {
+		return errors.New("smart_return.timeout_seconds must be >=1 and less than interval_seconds")
+	}
+	if s.FailThreshold < 1 || s.FailThreshold > 20 || s.RecoverThreshold < 1 || s.RecoverThreshold > 20 {
+		return errors.New("smart_return thresholds must be 1..20")
+	}
+	return nil
 }
 
 func applyKCPDefaults(k *KCPConfig) {

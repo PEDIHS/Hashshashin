@@ -54,12 +54,10 @@ func setupIranRouting(c *Config) error {
 		}
 	}
 
-	carrierPort, err := listenPort(c.Transport.Listen)
-	if err != nil {
-		return err
-	}
-	if err := ipt("filter", "-A", "HSH_INPUT", "-i", c.Network.PublicInterface, "-d", c.Network.PublicIP, "-s", c.Network.ForeignPublicIP, "-p", "udp", "--dport", strconv.Itoa(carrierPort), "-j", "ACCEPT"); err != nil {
-		return err
+	if c.SmartReturn.Enabled {
+		if err := ipt("filter", "-A", "HSH_INPUT", "-i", c.Network.PublicInterface, "-d", c.Network.IranPublicIP, "-s", c.Network.ForeignPublicIP, "-p", "udp", "--dport", strconv.Itoa(c.SmartReturn.ProbePort), "-j", "ACCEPT"); err != nil {
+			return err
+		}
 	}
 
 	for _, p := range c.Ports {
@@ -93,20 +91,26 @@ func setupIranRouting(c *Config) error {
 	return ipt("mangle", "-A", "HSH_MFWD", "-i", c.Network.PublicInterface, "-o", c.Network.PublicInterface, "-s", c.Network.ForeignPublicIP, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "conntrack", "--ctstate", "ESTABLISHED", "-j", "TCPMSS", "--set-mss", mss)
 }
 
+func setupTransportBypass(c *Config) error {
+	if err := runCmd("ip", "rule", "add", "priority", "77", "fwmark", fmt.Sprintf("0x%x", transportMark), "lookup", strconv.Itoa(transportTable)); err != nil {
+		return err
+	}
+	routeArgs := []string{"route", "add", "table", strconv.Itoa(transportTable), "default"}
+	if c.Network.PublicGateway != "" {
+		routeArgs = append(routeArgs, "via", c.Network.PublicGateway)
+	}
+	routeArgs = append(routeArgs, "dev", c.Network.PublicInterface, "src", c.Network.PublicIP)
+	return runCmd("ip", routeArgs...)
+}
+
 func setupKharejRouting(c *Config) error {
-	hooks := []struct{ table, chain, custom string }{{"filter", "INPUT", "HSH_INPUT"}, {"filter", "OUTPUT", "HSH_OUTPUT"}, {"mangle", "OUTPUT", "HSH_MOUT"}}
+	hooks := []struct{ table, chain, custom string }{
+		{"filter", "INPUT", "HSH_INPUT"}, {"filter", "OUTPUT", "HSH_OUTPUT"}, {"mangle", "OUTPUT", "HSH_MOUT"},
+	}
 	for _, h := range hooks {
 		if err := resetChain(h.table, h.chain, h.custom); err != nil {
 			return err
 		}
-	}
-
-	carrierPort, err := listenPort(c.Transport.Listen)
-	if err != nil {
-		return err
-	}
-	if err := ipt("filter", "-A", "HSH_INPUT", "-i", c.Network.PublicInterface, "-d", c.Network.PublicIP, "-s", c.Network.IranPublicIP, "-p", "udp", "--dport", strconv.Itoa(carrierPort), "-j", "ACCEPT"); err != nil {
-		return err
 	}
 
 	for _, p := range c.Ports {
@@ -124,18 +128,22 @@ func setupKharejRouting(c *Config) error {
 	}
 
 	if c.Mode == "direct-return" {
-		return ipt("filter", "-A", "HSH_OUTPUT", "-o", c.Network.PublicInterface, "-s", c.Network.ForeignPublicIP, "-d", c.Network.IranPublicIP, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+		if err := ipt("filter", "-A", "HSH_OUTPUT", "-o", c.Network.PublicInterface, "-s", c.Network.ForeignPublicIP, "-d", c.Network.IranPublicIP, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"); err != nil {
+			return err
+		}
+		if !c.SmartReturn.Enabled {
+			return nil
+		}
+
+		// Smart Return can route service responses through hsh0, while carrier
+		// and health-probe sockets remain forced to the normal Internet via 0x77.
+		if err := setupTransportBypass(c); err != nil {
+			return err
+		}
+		return ipt("filter", "-A", "HSH_OUTPUT", "-o", c.Tun.Name, "-s", c.Network.ForeignPublicIP, "-d", c.Network.IranPublicIP, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
 	}
 
-	if err := runCmd("ip", "rule", "add", "priority", "77", "fwmark", fmt.Sprintf("0x%x", transportMark), "lookup", strconv.Itoa(transportTable)); err != nil {
-		return err
-	}
-	routeArgs := []string{"route", "add", "table", strconv.Itoa(transportTable), "default"}
-	if c.Network.PublicGateway != "" {
-		routeArgs = append(routeArgs, "via", c.Network.PublicGateway)
-	}
-	routeArgs = append(routeArgs, "dev", c.Network.PublicInterface, "src", c.Network.PublicIP)
-	if err := runCmd("ip", routeArgs...); err != nil {
+	if err := setupTransportBypass(c); err != nil {
 		return err
 	}
 	if err := runCmd("ip", "route", "replace", c.Network.IranPublicIP+"/32", "dev", c.Tun.Name); err != nil {

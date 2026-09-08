@@ -1,266 +1,248 @@
 # Hashshashin — English Guide
 
-[← Back to project home](README.md) · [فارسی](README_FA.md)
+[← Project Home](README.md) · [فارسی](README_FA.md) · [Transports](docs/TRANSPORTS_FA.md) · [Smart Return](docs/SMART_RETURN_FA.md)
 
 ## Overview
 
-Hashshashin is an independently implemented Linux L3 tunnel that carries complete IPv4 packets through a TUN interface named `hsh0`.
+**Hashshashin** is an independently implemented Linux **Layer-3/TUN** tunnel that carries complete IPv4 packets through a virtual interface named `hsh0`.
 
-It supports two deployment modes:
+Current development version: **v0.2.0-alpha**.
 
-- **Full Tunnel** — both upload and download traverse the encrypted Hashshashin carrier.
-- **Direct Return** — upload traverses the Iran → Kharej tunnel, while download returns from Kharej to Iran through the normal Internet path. The end user continues to connect to the same Iran IP/port.
+It supports three practical routing modes:
 
-Current release: **v0.1.0 Official Beta**.
+1. **Full Tunnel** — upload and download both traverse Hashshashin.
+2. **Direct Return** — upload traverses the Iran → Kharej tunnel while download returns directly from Kharej to Iran through the normal Internet path.
+3. **Direct Return + Smart Return** — direct download is preferred; if that path becomes unhealthy, service responses automatically fall back to the tunnel and later recover to direct routing.
 
-## Why an L3 tunnel?
+The end-user endpoint remains the Iran server. Client-side VLESS, VMess, Trojan, Shadowsocks, WireGuard, or other service configuration does not need to change.
 
-A classic port forwarder usually terminates the user connection and creates another connection on the remote server. Hashshashin instead carries IP packets through TUN. This allows the Linux routing stack to make independent decisions about the forward and return paths.
+---
 
-That packet-level model is what makes Direct Return possible without changing the user's configured endpoint.
+## Architecture
 
-## Features
+```text
+User protocol
+VLESS / VMess / Trojan / Shadowsocks / WireGuard / ...
+                         |
+                         v
+                    Linux L3/TUN
+                         |
+                       HSH1
+     HMAC handshake + AES-256-GCM + replay protection
+                         |
+                Transport Manager
+                  /      |      \
+                UDP     TCP     KCP/FEC
+                         |
+                   Iran <-> Kharej
+```
 
-### Data plane
+Hashshashin is not a classic port proxy. It transports IP packets and relies on Linux routing, conntrack and NAT for forwarding decisions.
 
-- Linux TUN interface (`hsh0`)
-- complete IPv4 packet transport
-- Full Tunnel mode
-- Direct Return mode
-- transparent destination routing toward configured Kharej service ports
-- Linux conntrack/NAT integration
-- dedicated policy-routing tables
+---
 
-### Transport and session security
+## Path Modes
 
-- authenticated UDP carrier
+| Mode | Upload | Download | Automatic Return Failover |
+|---|---|---|---|
+| Full Tunnel | Tunnel | Tunnel | — |
+| Direct Return | Tunnel | Direct Kharej → Iran | No |
+| Direct Return + Smart Return | Tunnel | Direct preferred, tunnel fallback | Yes |
+
+### Smart Return
+
+Smart Return probes the direct Kharej → Iran direction. Defaults:
+
+```text
+probe_port         9001/UDP
+interval           5s
+timeout             2s
+failure threshold  3
+recovery threshold 3
+```
+
+A probe contains an independent `HDP1` header, timestamp, random nonce and HMAC-SHA256 using the tunnel PSK. Iran returns the nonce through an encrypted HSH1 control message.
+
+The routing domains are isolated:
+
+```text
+0x66 / table 166 -> user upload/data
+0x68 / table 168 -> Smart Return service responses
+0x77 / table 167 -> carrier + direct health probe bypass
+```
+
+Smart Return changes only configured service-response flows. It does not install a broad main-table route that would redirect unrelated SSH or management traffic.
+
+See: [Smart Return design and operations](docs/SMART_RETURN_FA.md).
+
+---
+
+## Implemented Carriers
+
+| Carrier | Status | Typical Use |
+|---|---:|---|
+| UDP | ✅ | lowest overhead and latency |
+| Framed TCP | ✅ | networks where UDP is restricted or degraded |
+| KCP | ✅ | lossy/jittery paths requiring fast ARQ |
+| KCP + FEC 10/3 | ✅ | balanced loss recovery preset |
+| KCP + FEC 10/5 | ✅ | stronger FEC with higher bandwidth overhead |
+| Raw/Pcap | Roadmap | not implemented yet |
+| QUIC/WSS | Roadmap | not implemented yet |
+| Multipath | Roadmap | not implemented yet |
+
+All carriers share the same HSH1 session security:
+
 - 256-bit pre-shared key
-- HMAC-SHA256 handshake authentication
-- fresh random client and server nonces
-- independent directional AES-256-GCM session keys
-- packet counters
-- 64-packet replay window
-- out-of-order packet tolerance
+- HMAC-SHA256 authenticated handshake
+- fresh client/server nonces
+- independent TX/RX AES-256-GCM session keys
+- packet counters and replay window
 - keepalive
 - reconnect
 - periodic rekey
 
-### Routing hardening
+KCP support uses `github.com/xtaci/kcp-go/v5` under its MIT license.
 
-Hashshashin separates the application data plane from the outer carrier:
+---
 
-- data mark: `0x66`
-- data routing table: `166`
-- carrier mark: `0x77`
-- carrier routing table: `167`
+# Installation
 
-This separation prevents the outer UDP carrier from recursively entering the tunnel when Full Tunnel routes are active.
-
-### Firewall behavior
-
-Hashshashin creates dedicated iptables chains and does not globally change the host's INPUT or FORWARD policy to ACCEPT.
-
-The installer can optionally block direct public access to configured service ports on the Kharej host while still allowing the tunnel path.
-
-## Requirements
-
-- Linux
-- IPv4
-- root access / `CAP_NET_ADMIN`
-- `/dev/net/tun`
-- `iproute2`
-- `iptables`
-- systemd for the official installer
-- `apt` or `dnf` based distribution for the one-line installer
-- Go 1.18+ when building from source
-
-Ubuntu and Debian are the primary tested installer targets. RHEL-compatible systems are supported on a best-effort basis.
-
-## One-line installation
-
-Run on both servers:
+Run the same installer on both Iran and Kharej servers:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh)
 ```
 
-Install Iran first, then Kharej.
+Recommended order: **Iran first, Kharej second**.
 
-### Step 1 — Iran
+The wizard performs:
+
+```text
+[1/8] System check & dependencies
+[2/8] Download, test & build
+[3/8] Select server role
+[4/8] Tunnel mode & Smart Return
+[5/8] Select carrier transport
+[6/8] Network & service configuration
+[7/8] Peer & security
+[8/8] Start & verify
+```
+
+### Iran
 
 Choose:
 
 ```text
-1) Iran (entry server)
+IRAN / Entry
+Full Tunnel or Direct Return
+Smart Return (optional for Direct Return)
+UDP / TCP / KCP carrier
 ```
 
-Then choose the operating mode:
+The installer generates a 256-bit Shared Key. Save it for the Kharej installation.
 
-```text
-1) Full tunnel
-2) Direct return
-```
+### Kharej
 
-The wizard asks for:
+Run the installer again and select `KHAREJ / Exit`. Use matching:
 
-- public interface
-- local public IPv4
-- public gateway
-- UDP carrier port
+- mode
+- carrier type
+- carrier port
 - service ports
-- tunnel MTU
-- Kharej public IPv4
+- Smart Return settings
+- Shared Key
 
-The installer then generates a shared key. Save the exact value.
+---
 
-### Step 2 — Kharej
+## Provider Firewall
 
-Run the same command and choose:
-
-```text
-2) Kharej (service server)
-```
-
-Use the **same**:
-
-- operating mode
-- UDP carrier port
-- service port list
-- shared key
-
-The installer can also ask whether direct public access to the configured service ports should be blocked on Kharej.
-
-### Step 3 — Cloud firewall
-
-If your provider has a separate firewall/security-group layer, allow the UDP carrier port between the Iran and Kharej public IP addresses.
-
-Default example:
+Allow the carrier only between the two server IPs:
 
 ```text
-Protocol: UDP
-Port:     9000
-Source:   Iran public IP
-Target:   Kharej public IP
+UDP or KCP : UDP/<carrier-port>
+TCP        : TCP/<carrier-port>
 ```
 
-Do not expose the carrier to the entire Internet unless your environment requires it.
-
-### Step 4 — Destination service
-
-Your Kharej service, for example Xray/3x-ui, must listen on:
+When Smart Return is enabled, also allow:
 
 ```text
-0.0.0.0:<service-port>
+Protocol    UDP
+Source      Kharej Public IP
+Destination Iran Public IP
+Port        smart_return.probe_port (default 9001)
 ```
 
-or:
+There is no need to expose the probe port to the whole Internet.
 
-```text
-Kharej_Public_IP:<service-port>
-```
+---
 
-A listener bound only to `127.0.0.1` will not receive traffic addressed to the Kharej public IP through `hsh0`.
+## Direct Return Requirement
 
-## Direct Return prerequisites
-
-Direct Return requires the Iran public IPv4 to be actually assigned to the Iran server's interface.
-
-Verify with:
+The Iran public IPv4 address must actually be assigned to the Iran server interface:
 
 ```bash
 ip -4 addr show
 ```
 
-If the host only receives Internet connectivity through an upstream NAT/CGNAT address that is not locally assigned, Direct Return is not supported in v0.1. Use Full Tunnel instead.
+An upstream-NAT/CGNAT-only Iran endpoint is not supported by Direct Return in the current release. Use Full Tunnel in that environment.
 
-## Architecture
+---
 
-### Full Tunnel
+## Kharej Service Binding
 
-```text
-Client
-  |
-  v
-Iran public endpoint
-  |
-  v
-hsh0 (Iran)
-  |
-  | authenticated + encrypted UDP carrier
-  v
-hsh0 (Kharej)
-  |
-  v
-Kharej service
-  |
-  v
-hsh0 (Kharej)
-  |
-  v
-hsh0 (Iran)
-  |
-  v
-Client
-```
-
-### Direct Return
+For example, an Xray/3x-ui inbound on port `443` should normally listen on:
 
 ```text
-UPLOAD
-Client -> Iran -> hsh0 ===== encrypted tunnel =====> hsh0 -> Kharej service
-
-DOWNLOAD
-Client <- Iran <----------- normal Internet ----------- Kharej service
+0.0.0.0:443
 ```
 
-Iran conntrack preserves the connection/NAT state and rewrites the returning packets so the user's endpoint remains unchanged.
+or the Kharej public address. Binding only to `127.0.0.1:443` is not suitable for this topology because service packets arrive from `hsh0` addressed to the Kharej public IP.
 
-## MTU and MSS
+---
 
-Default tunnel MTU is `1320`.
+# Management
 
-The installer accepts values from `900` to `1400`.
+After installation:
 
-Start with `1320`. If the path shows fragmentation symptoms, stalls, or provider-specific encapsulation overhead, test values such as `1280` or `1240`.
+```bash
+hashshashin
+```
 
-TCP MSS clamping is applied to reduce the chance of tunnel-path fragmentation. Direct Return uses direction-aware handling so the direct download side is not unnecessarily constrained by the upload tunnel MTU.
+The interactive manager shows:
 
-## Management
+- service state
+- Iran/Kharej role
+- Full/Direct mode
+- active carrier
+- TUN/MTU
+- RX/TX counters
+- Smart Return enabled/disabled
+- current return path (`DIRECT` or `TUNNEL` on Kharej)
+- health checks
+- live logs
+- network diagnostics
+- safe config view
+- update/reconfigure/uninstall actions
 
-Status:
+Useful direct commands:
 
 ```bash
 systemctl status hashshashin
-```
-
-Live logs:
-
-```bash
 journalctl -u hashshashin -f
-```
-
-Restart:
-
-```bash
-systemctl restart hashshashin
-```
-
-Validate configuration:
-
-```bash
 hashshashin -check -c /etc/hashshashin/config.json
+hashshashin -summary -c /etc/hashshashin/config.json
 ```
 
-Show version:
+Update while preserving configuration:
 
 ```bash
-hashshashin -version
+bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh) --update
 ```
 
-Remove Hashshashin networking rules without uninstalling:
+Reconfigure:
 
 ```bash
-hashshashin -cleanup -c /etc/hashshashin/config.json
+bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh) --reconfigure
 ```
 
 Uninstall:
@@ -269,102 +251,59 @@ Uninstall:
 bash <(curl -fsSL https://raw.githubusercontent.com/PEDIHS/Hashshashin/main/install.sh) --uninstall
 ```
 
-The installer keeps `/etc/hashshashin/config.json` during uninstall by default so the shared key and configuration are not accidentally lost.
+---
 
-## Verification
+## CI and Verification
 
-On Iran:
+GitHub Actions runs on Go 1.18 and Go 1.22 and includes:
 
-```bash
-ip addr show hsh0
-ip rule show
-ip route show table 166
-iptables -t nat -S | grep HSH
-journalctl -u hashshashin -n 100 --no-pager
-```
-
-On Kharej:
-
-```bash
-ip addr show hsh0
-ss -lntup
-journalctl -u hashshashin -n 100 --no-pager
-```
-
-For Direct Return, packet capture should generally show:
-
-```text
-Iran hsh0       -> upload application packets
-Kharej hsh0     -> upload application packets
-Kharej public   -> download application packets
-Iran public     -> download application packets
-```
-
-The Persian live verification guide contains more detailed commands: [docs/VERIFY_FA.md](docs/VERIFY_FA.md).
-
-## CI and testing
-
-The repository CI currently validates the core on Go 1.18 and Go 1.22 and includes:
-
-- race-enabled unit tests
-- transport/session integration test over loopback UDP
-- authenticated handshake validation
-- directional session-key validation
-- encrypted payload delivery validation
+- `go test -race ./...`
+- HSH1 crypto/session/replay tests
+- UDP handshake + encrypted payload integration
+- framed TCP carrier integration
+- KCP/FEC carrier integration
+- Smart Return HMAC probe authentication
+- Smart Return hysteresis tests
+- encrypted direct-probe ACK dispatch
 - `go vet`
 - `go build`
-- installer shell syntax validation
+- installer and manager shell syntax checks
 
-CI passing does not replace a two-VPS network test because TUN, policy routing, provider firewalls and Direct Return path behavior are infrastructure-dependent.
+A green CI run does **not** prove every real-world ISP/provider route. TUN, conntrack/NAT, MTU, firewall behavior, Direct Return, and failover must still be verified on real Iran/Kharej VPS infrastructure before production deployment.
 
-## Security considerations
+---
 
-The v0.1 protocol has not yet undergone an independent external security audit.
+## Security Notes
 
-For sensitive deployments:
+Hashshashin does not change the host's global firewall policy to `ACCEPT`; it owns dedicated `HSH_*` chains. Keep the Shared Key private and separately restrict SSH, management panels and databases.
 
-- restrict the carrier port to known peer IPs where possible
-- keep SSH/admin panels separately protected
-- use the installer's service-port lock option on Kharej when appropriate
-- keep the shared key private
-- review `SECURITY.md`
-- validate routing/firewall state before enabling user traffic
+HSH1 has not yet undergone an independent external security audit.
 
 See [SECURITY.md](SECURITY.md).
 
-## Current limitations
-
-- IPv6 is not yet implemented.
-- UDP is the current carrier.
-- Raw/KCP and multipath carriers are roadmap items.
-- automatic Direct → Tunnel quality failover is not yet active in v0.1.
-- Direct Return does not support an Iran server that only has upstream NAT/CGNAT addressing.
-- provider-specific routing/security behavior can affect operation.
+---
 
 ## Roadmap
 
-- automatic Direct Return health monitoring and fallback
-- multipath transport
-- optional Raw/KCP-style carrier
-- IPv6
-- release binaries
-- package repositories
-- external security review
-- multi-provider benchmarks
+- [x] L3/TUN core
+- [x] Full Tunnel
+- [x] Direct Return
+- [x] UDP carrier
+- [x] TCP carrier
+- [x] KCP/FEC carrier
+- [x] reconnect / keepalive / rekey / replay protection
+- [x] Smart Return health protocol
+- [x] Direct → Tunnel → Direct return-path failover
+- [x] service-scoped return policy routing
+- [ ] Raw TCP / pcap carrier
+- [ ] QUIC / WSS carrier
+- [ ] multipath / multi-carrier bonding
+- [ ] automatic carrier failover
+- [ ] IPv6
+- [ ] binary/package releases
+- [ ] independent external security audit
+- [ ] multi-provider benchmark suite
 
-## Original implementation
+---
 
-Hashshashin does not copy source code from Paqet, Backhaul or BackPack. Public architectural ideas such as packet transport, TUN/L3 forwarding and carrier/data-plane isolation were studied, while this project's core and wire protocol are independently implemented.
-
-## More documentation
-
-- [Step-by-step installation](docs/INSTALL_EN.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Security](SECURITY.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-- [Persian guide](README_FA.md)
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Hashshashin is independently implemented. Public architectural concepts from other tunnel projects have been studied, but the L3 core, HSH1 protocol, routing controller, installer and Smart Return implementation are not source-code copies of Paqet, Backhaul or BackPack.

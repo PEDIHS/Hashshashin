@@ -74,6 +74,7 @@ func main() {
 		log.Fatal("Hashshashin must run as root")
 	}
 	if *cleanup {
+		cleanupSmartReturnPolicy(cfg)
 		cleanupRouting(cfg)
 		return
 	}
@@ -116,6 +117,13 @@ func printConfigSummary(c *Config) {
 	fmt.Printf("carrier_listen=%s\n", c.Transport.Listen)
 	fmt.Printf("carrier_peer=%s\n", peer)
 	fmt.Printf("service_ports=%s\n", strings.Join(ports, ","))
+	fmt.Printf("smart_return=%t\n", c.SmartReturn.Enabled)
+	if c.SmartReturn.Enabled {
+		fmt.Printf("smart_probe_port=%d\n", c.SmartReturn.ProbePort)
+		fmt.Printf("smart_interval=%d\n", c.SmartReturn.IntervalSeconds)
+		fmt.Printf("smart_timeout=%d\n", c.SmartReturn.TimeoutSeconds)
+		fmt.Printf("smart_thresholds=%d/%d\n", c.SmartReturn.FailThreshold, c.SmartReturn.RecoverThreshold)
+	}
 	if c.Transport.Type == "kcp" {
 		fmt.Printf("kcp_fec=%d/%d\n", c.Transport.KCP.DataShards, c.Transport.KCP.ParityShards)
 		fmt.Printf("kcp_window=%d/%d\n", c.Transport.KCP.SendWindow, c.Transport.KCP.ReceiveWindow)
@@ -123,13 +131,14 @@ func printConfigSummary(c *Config) {
 }
 
 func run(c *Config) error {
-	log.Printf("Hashshashin %s starting role=%s mode=%s transport=%s", version, c.Role, c.Mode, c.Transport.Type)
+	log.Printf("Hashshashin %s starting role=%s mode=%s transport=%s smart-return=%t", version, c.Role, c.Mode, c.Transport.Type, c.SmartReturn.Enabled)
 	tun, err := openTun(c.Tun.Name)
 	if err != nil {
 		return err
 	}
 	defer tun.Close()
 
+	cleanupSmartReturnPolicy(c)
 	cleanupRouting(c)
 	if err := setupTun(c); err != nil {
 		return err
@@ -138,11 +147,20 @@ func run(c *Config) error {
 		cleanupRouting(c)
 		return err
 	}
-	if err := setupCarrierFirewall(c); err != nil {
+	if err := setupSmartReturnPolicy(c); err != nil {
+		cleanupSmartReturnPolicy(c)
 		cleanupRouting(c)
 		return err
 	}
-	defer cleanupRouting(c)
+	if err := setupCarrierFirewall(c); err != nil {
+		cleanupSmartReturnPolicy(c)
+		cleanupRouting(c)
+		return err
+	}
+	defer func() {
+		cleanupSmartReturnPolicy(c)
+		cleanupRouting(c)
+	}()
 
 	key, _ := base64.StdEncoding.DecodeString(c.Transport.Key)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -156,12 +174,21 @@ func run(c *Config) error {
 	log.Printf("carrier=%s listen=%s peer=%s", carrier.Name(), c.Transport.Listen, c.Transport.Peer)
 
 	st := &tunnelState{hellos: make(map[[32]byte]helloRecord)}
+	if c.SmartReturn.Enabled {
+		st.initProbeAck()
+	}
 	go recvLoop(ctx, carrier, tun, key, st, c.Role)
 
 	if c.Role == "iran" {
 		go clientSupervisor(ctx, carrier, key, st, c)
+		if c.SmartReturn.Enabled {
+			go runDirectProbeResponder(ctx, c, key, carrier, st)
+		}
 	} else {
 		go serverSupervisor(ctx, carrier, st, c)
+		if c.SmartReturn.Enabled {
+			go runDirectProbeMonitor(ctx, c, key, st)
+		}
 	}
 	go statsLoop(ctx, st)
 
