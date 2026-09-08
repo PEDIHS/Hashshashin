@@ -1,5 +1,5 @@
 name: پیشنهاد قابلیت
-about: پیشنهاد برای Core، Carrier، Routing، Installer یا Documentation
+description: پیشنهاد برای Core، Carrier، Routing، Installer یا Documentation
 labels: []
 body:
   - type: textarea
