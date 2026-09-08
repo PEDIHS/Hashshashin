@@ -54,8 +54,6 @@ func setupIranRouting(c *Config) error {
 		}
 	}
 
-	// Carrier access is installed later by setupCarrierFirewall(), because it
-	// depends on whether the selected carrier is UDP/KCP or TCP.
 	if c.SmartReturn.Enabled {
 		if err := ipt("filter", "-A", "HSH_INPUT", "-i", c.Network.PublicInterface, "-d", c.Network.IranPublicIP, "-s", c.Network.ForeignPublicIP, "-p", "udp", "--dport", strconv.Itoa(c.SmartReturn.ProbePort), "-j", "ACCEPT"); err != nil {
 			return err
@@ -106,14 +104,15 @@ func setupTransportBypass(c *Config) error {
 }
 
 func setupKharejRouting(c *Config) error {
-	hooks := []struct{ table, chain, custom string }{{"filter", "INPUT", "HSH_INPUT"}, {"filter", "OUTPUT", "HSH_OUTPUT"}, {"mangle", "OUTPUT", "HSH_MOUT"}}
+	hooks := []struct{ table, chain, custom string }{
+		{"filter", "INPUT", "HSH_INPUT"}, {"filter", "OUTPUT", "HSH_OUTPUT"}, {"mangle", "OUTPUT", "HSH_MOUT"},
+	}
 	for _, h := range hooks {
 		if err := resetChain(h.table, h.chain, h.custom); err != nil {
 			return err
 		}
 	}
 
-	// The transport-specific INPUT rule is added by setupCarrierFirewall().
 	for _, p := range c.Ports {
 		for _, proto := range protocols(p.Protocol) {
 			port := strconv.Itoa(p.Port)
@@ -124,6 +123,7 @@ func setupKharejRouting(c *Config) error {
 				if err := ipt("filter", "-A", "HSH_INPUT", "-i", c.Network.PublicInterface, "-d", c.Network.ForeignPublicIP, "-p", proto, "--dport", port, "-j", "DROP"); err != nil {
 					return err
 				}
+			}
 		}
 	}
 
@@ -135,25 +135,12 @@ func setupKharejRouting(c *Config) error {
 			return nil
 		}
 
-		// Smart Return may install an Iran /32 route through hsh0. Carrier and
-		// direct health-probe sockets use SO_MARK=0x77, so table 167 must always
-		// retain a normal-Internet default route while failover is enabled.
+		// Smart Return can route service responses through hsh0, while carrier
+		// and health-probe sockets remain forced to the normal Internet via 0x77.
 		if err := setupTransportBypass(c); err != nil {
 			return err
 		}
-		if err := ipt("filter", "-A", "HSH_OUTPUT", "-o", c.Tun.Name, "-s", c.Network.ForeignPublicIP, "-d", c.Network.IranPublicIP, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"); err != nil {
-			return err
-		}
-		mss := strconv.Itoa(c.Tun.MTU - 40)
-		for _, p := range c.Ports {
-			if p.Protocol == "udp" {
-				continue
-			}
-			if err := ipt("mangle", "-A", "HSH_MOUT", "-o", c.Tun.Name, "-s", c.Network.ForeignPublicIP, "-d", c.Network.IranPublicIP, "-p", "tcp", "--sport", strconv.Itoa(p.Port), "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", mss); err != nil {
-				return err
-			}
-		}
-		return setKharejReturnPath(c, returnPathDirect)
+		return ipt("filter", "-A", "HSH_OUTPUT", "-o", c.Tun.Name, "-s", c.Network.ForeignPublicIP, "-d", c.Network.IranPublicIP, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
 	}
 
 	if err := setupTransportBypass(c); err != nil {
