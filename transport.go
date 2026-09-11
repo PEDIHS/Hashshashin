@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +32,22 @@ type helloRecord struct {
 	ack     []byte
 }
 
+type runtimeMetrics struct {
+	dataTxBytes    uint64
+	dataRxBytes    uint64
+	dataTxPackets  uint64
+	dataRxPackets  uint64
+	controlTxBytes uint64
+	controlRxBytes uint64
+	controlTxPkts  uint64
+	controlRxPkts  uint64
+	sendErrors     uint64
+	decryptErrors  uint64
+	replayDrops    uint64
+	noSessionDrops uint64
+	tunReadErrors  uint64
+}
+
 type tunnelState struct {
 	sessMu     sync.RWMutex
 	session    *session
@@ -39,7 +58,13 @@ type tunnelState struct {
 	hellos     map[[32]byte]helloRecord
 	probeMu    sync.Mutex
 	probeAck   chan [16]byte
+	metrics    runtimeMetrics
 }
+
+var encryptedPacketPool = sync.Pool{New: func() interface{} {
+	b := make([]byte, 0, 65536+128)
+	return &b
+}}
 
 func (s *tunnelState) loadSession() *session {
 	s.sessMu.RLock()
@@ -48,6 +73,9 @@ func (s *tunnelState) loadSession() *session {
 }
 
 func (s *tunnelState) storeSession(v *session) {
+	if v != nil {
+		v.metrics = &s.metrics
+	}
 	s.sessMu.Lock()
 	s.session = v
 	s.sessMu.Unlock()
@@ -297,53 +325,116 @@ func handleEncrypted(tun io.Writer, peer string, p []byte, st *tunnelState) {
 	}
 	counter := binary.BigEndian.Uint64(p[5:13])
 	nonce := makeNonce(counter)
-	plain, err := ss.rxAEAD.Open(nil, nonce[:], p[13:], p[:13])
-	if err != nil || !ss.replay.accept(counter) {
+
+	// Decrypt in place. The old path used Open(nil, ...), allocating a fresh
+	// slice for every packet. The ciphertext area is no longer needed once the
+	// tag verifies, so reusing it removes a hot-path allocation and copy.
+	plain, err := ss.rxAEAD.Open(p[13:13], nonce[:], p[13:], p[:13])
+	if err != nil {
+		atomic.AddUint64(&st.metrics.decryptErrors, 1)
+		return
+	}
+	if !ss.replay.accept(counter) {
+		atomic.AddUint64(&st.metrics.replayDrops, 1)
 		return
 	}
 	ss.touch()
 	atomic.AddUint64(&ss.rxBytes, uint64(len(plain)))
 	switch p[4] {
 	case msgData:
+		atomic.AddUint64(&st.metrics.dataRxBytes, uint64(len(plain)))
+		atomic.AddUint64(&st.metrics.dataRxPackets, 1)
 		if len(plain) > 0 {
 			_, _ = tun.Write(plain)
 		}
 	case msgDirectProbeAck:
+		atomic.AddUint64(&st.metrics.controlRxBytes, uint64(len(plain)))
+		atomic.AddUint64(&st.metrics.controlRxPkts, 1)
 		if len(plain) == 16 {
 			var probeNonce [16]byte
 			copy(probeNonce[:], plain)
 			st.notifyProbeAck(probeNonce)
 		}
+	default:
+		atomic.AddUint64(&st.metrics.controlRxBytes, uint64(len(plain)))
+		atomic.AddUint64(&st.metrics.controlRxPkts, 1)
 	}
 }
 
 func sendEncrypted(carrier packetCarrier, s *session, typ byte, payload []byte) error {
 	counter := atomic.AddUint64(&s.tx, 1)
-	header := make([]byte, 13)
-	copy(header[:4], magic)
-	header[4] = typ
-	binary.BigEndian.PutUint64(header[5:13], counter)
+	holder := encryptedPacketPool.Get().(*[]byte)
+	buf := *holder
+	need := 13 + len(payload) + s.txAEAD.Overhead()
+	if cap(buf) < need {
+		buf = make([]byte, 13, need)
+	} else {
+		buf = buf[:13]
+	}
+	copy(buf[:4], magic)
+	buf[4] = typ
+	binary.BigEndian.PutUint64(buf[5:13], counter)
 	nonce := makeNonce(counter)
-	ciphertext := s.txAEAD.Seal(nil, nonce[:], payload, header)
-	packet := append(header, ciphertext...)
+	packet := s.txAEAD.Seal(buf, nonce[:], payload, buf[:13])
 	err := carrier.WritePacket(packet, s.peer)
 	if err == nil {
 		atomic.AddUint64(&s.txBytes, uint64(len(payload)))
+		if s.metrics != nil {
+			if typ == msgData {
+				atomic.AddUint64(&s.metrics.dataTxBytes, uint64(len(payload)))
+				atomic.AddUint64(&s.metrics.dataTxPackets, 1)
+			} else {
+				atomic.AddUint64(&s.metrics.controlTxBytes, uint64(len(payload)))
+				atomic.AddUint64(&s.metrics.controlTxPkts, 1)
+			}
+		}
+	} else if s.metrics != nil {
+		atomic.AddUint64(&s.metrics.sendErrors, 1)
+	}
+	*holder = packet[:0]
+	if cap(*holder) <= maxCarrierFrame+128 {
+		encryptedPacketPool.Put(holder)
 	}
 	return err
 }
 
-func statsLoop(ctx context.Context, st *tunnelState) {
-	ticker := time.NewTicker(time.Minute)
+func readInterfaceCounter(name, stat string) uint64 {
+	b, err := os.ReadFile("/sys/class/net/" + name + "/statistics/" + stat)
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	return v
+}
+
+func statsLoop(ctx context.Context, st *tunnelState, c *Config) {
+	interval := time.Duration(c.Performance.StatsIntervalSeconds) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var prevTx, prevRx uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			tx := atomic.LoadUint64(&st.metrics.dataTxBytes)
+			rx := atomic.LoadUint64(&st.metrics.dataRxBytes)
+			txRate := float64(tx-prevTx) * 8 / interval.Seconds() / 1e6
+			rxRate := float64(rx-prevRx) * 8 / interval.Seconds() / 1e6
+			prevTx, prevRx = tx, rx
+			peer, idle := "-", "-"
 			if s := st.loadSession(); s != nil {
-				log.Printf("stats peer=%s tx=%dB rx=%dB idle=%s", s.peer, atomic.LoadUint64(&s.txBytes), atomic.LoadUint64(&s.rxBytes), s.idle().Round(time.Second))
+				peer = s.peer
+				idle = s.idle().Round(time.Millisecond).String()
 			}
+			log.Printf("stats role=%s mode=%s peer=%s hsh_data_tx=%dB/%dpkts hsh_data_rx=%dB/%dpkts rate_tx=%.1fMbit/s rate_rx=%.1fMbit/s ctrl_tx=%dpkts ctrl_rx=%dpkts tun_tx_drop=%d tun_rx_drop=%d send_err=%d decrypt_err=%d replay_drop=%d no_session_drop=%d idle=%s",
+				c.Role, c.Mode, peer,
+				tx, atomic.LoadUint64(&st.metrics.dataTxPackets),
+				rx, atomic.LoadUint64(&st.metrics.dataRxPackets), txRate, rxRate,
+				atomic.LoadUint64(&st.metrics.controlTxPkts), atomic.LoadUint64(&st.metrics.controlRxPkts),
+				readInterfaceCounter(c.Tun.Name, "tx_dropped"), readInterfaceCounter(c.Tun.Name, "rx_dropped"),
+				atomic.LoadUint64(&st.metrics.sendErrors), atomic.LoadUint64(&st.metrics.decryptErrors),
+				atomic.LoadUint64(&st.metrics.replayDrops), atomic.LoadUint64(&st.metrics.noSessionDrops), idle)
 		}
 	}
 }
