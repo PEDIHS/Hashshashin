@@ -64,8 +64,8 @@ func TestPerformanceDefaults(t *testing.T) {
 	if p.TunQueues < 1 || p.TunQueues > 4 {
 		t.Fatalf("default tun queues=%d want 1..4", p.TunQueues)
 	}
-	if p.ReceiveWorkers < 1 || p.ReceiveWorkers > 4 {
-		t.Fatalf("default receive workers=%d want 1..4", p.ReceiveWorkers)
+	if p.ReceiveWorkers != 1 {
+		t.Fatalf("default receive workers=%d want 1 for ordered single-flow UDP receive", p.ReceiveWorkers)
 	}
 	if p.TxQueueLen != 4096 {
 		t.Fatalf("default tx queue=%d want 4096", p.TxQueueLen)
@@ -75,6 +75,27 @@ func TestPerformanceDefaults(t *testing.T) {
 	}
 	if p.SocketBuffer != 8*1024*1024 {
 		t.Fatalf("default socket buffer=%d", p.SocketBuffer)
+	}
+	if err := validatePerformance(p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOfficialProfilesNormalizeReceiveWorkers(t *testing.T) {
+	for _, profile := range []string{"balance", "turbo", "throughput"} {
+		p := PerformanceConfig{Profile: profile, ReceiveWorkers: 8}
+		applyPerformanceDefaults(&p)
+		if p.ReceiveWorkers != 1 {
+			t.Fatalf("profile=%s receive_workers=%d want 1", profile, p.ReceiveWorkers)
+		}
+	}
+}
+
+func TestCustomProfileCanOptIntoParallelReceive(t *testing.T) {
+	p := PerformanceConfig{Profile: "custom", ReceiveWorkers: 4}
+	applyPerformanceDefaults(&p)
+	if p.ReceiveWorkers != 4 {
+		t.Fatalf("custom receive workers=%d want 4", p.ReceiveWorkers)
 	}
 	if err := validatePerformance(p); err != nil {
 		t.Fatal(err)
