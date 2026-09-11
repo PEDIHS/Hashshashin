@@ -30,8 +30,8 @@ Hashshashin repeatable benchmark
   sudo hsh-bench soak HOST [port] [cycles] [parallel]
       Stability test. Runs forward/reverse traffic, restarts Hashshashin between
       cycles, waits for service + hsh0 recovery, and reports throughput spread,
-      TUN drop deltas, restart times and any SIGKILL/stop-timeout evidence.
-      Defaults: port=39001 cycles=5 parallel=8.
+      per-cycle TUN drop deltas, restart times and any SIGKILL/stop-timeout
+      evidence. Defaults: port=39001 cycles=5 parallel=8.
 
 Raw JSON and summaries are stored under /tmp/hashshashin-bench-* or
 /tmp/hashshashin-soak-*.
@@ -220,25 +220,36 @@ soak(){
   ip link show hsh0 >/dev/null 2>&1 || fail "hsh0 is missing before soak"
   wait_peer "$host" "$port" || fail "benchmark peer is not reachable at $host:$port"
 
-  local stamp dir tx0 tx1 rx0 rx1 i since start end elapsed restart_failures=0
+  local stamp dir i since start end elapsed restart_failures=0
+  local cycle_tx0 cycle_tx1 cycle_rx0 cycle_rx1 cycle_tx_delta cycle_rx_delta
+  local total_tx_drops=0 total_rx_drops=0
   stamp="$(date +%Y%m%d-%H%M%S)"
   dir="/tmp/hashshashin-soak-${stamp}"
   mkdir -p "$dir"
   since="$(date -Is)"
   show_host_context | tee "$dir/context.txt"
-  tx0="$(iface_stat tx_dropped)"; rx0="$(iface_stat rx_dropped)"
 
   echo "[hsh-bench] soak warmup forward ${WARMUP_DEFAULT}s + reverse ${WARMUP_DEFAULT}s"
   run_one "$host" "$port" "$parallel" "$WARMUP_DEFAULT" 0 "$dir/warmup-forward.json"
   run_one "$host" "$port" "$parallel" "$WARMUP_DEFAULT" 1 "$dir/warmup-reverse.json"
 
   : >"$dir/restarts.txt"
+  : >"$dir/drops.txt"
   for ((i=1; i<=cycles; i++)); do
+    cycle_tx0="$(iface_stat tx_dropped)"; cycle_rx0="$(iface_stat rx_dropped)"
+
     printf '[hsh-bench] soak cycle %d/%d forward...\n' "$i" "$cycles"
     run_one "$host" "$port" "$parallel" "$DURATION_DEFAULT" 0 "$(printf '%s/run-%02d-forward.json' "$dir" "$i")"
     sleep 1
     printf '[hsh-bench] soak cycle %d/%d reverse...\n' "$i" "$cycles"
     run_one "$host" "$port" "$parallel" "$DURATION_DEFAULT" 1 "$(printf '%s/run-%02d-reverse.json' "$dir" "$i")"
+
+    cycle_tx1="$(iface_stat tx_dropped)"; cycle_rx1="$(iface_stat rx_dropped)"
+    cycle_tx_delta=$(( cycle_tx1 >= cycle_tx0 ? cycle_tx1-cycle_tx0 : cycle_tx1 ))
+    cycle_rx_delta=$(( cycle_rx1 >= cycle_rx0 ? cycle_rx1-cycle_rx0 : cycle_rx1 ))
+    total_tx_drops=$((total_tx_drops + cycle_tx_delta))
+    total_rx_drops=$((total_rx_drops + cycle_rx_delta))
+    echo "cycle=$i tx_drop_delta=$cycle_tx_delta rx_drop_delta=$cycle_rx_delta" | tee -a "$dir/drops.txt"
 
     if (( i < cycles )); then
       echo "[hsh-bench] restarting Hashshashin after cycle $i"
@@ -269,14 +280,18 @@ soak(){
     fail "soak restart/recovery failed; evidence saved in $dir"
   fi
 
-  tx1="$(iface_stat tx_dropped)"; rx1="$(iface_stat rx_dropped)"
-  summarize "$dir" "$cycles" "$parallel" "$DURATION_DEFAULT" "$tx0" "$tx1" "$rx0" "$rx1" | tee "$dir/summary.txt"
+  # hsh0 is recreated on every service restart, so its kernel counters reset.
+  # Feed the sum of per-cycle deltas into the normal summary instead of using
+  # only the first/last interface lifetime.
+  summarize "$dir" "$cycles" "$parallel" "$DURATION_DEFAULT" 0 "$total_tx_drops" 0 "$total_rx_drops" | tee "$dir/summary.txt"
   journalctl -u "$SERVICE" --since "$since" --no-pager >"$dir/journal.txt" 2>/dev/null || true
 
   local kills
   kills="$(grep -Eic 'status=9/KILL|SIGKILL|timed out.*[Kk]ill|State .*stop.*timed out' "$dir/journal.txt" 2>/dev/null || true)"
   echo "restart_failures=$restart_failures" | tee -a "$dir/summary.txt"
   echo "sigkill_or_stop_timeout_evidence=$kills" | tee -a "$dir/summary.txt"
+  echo "soak_tx_dropped_total=$total_tx_drops" | tee -a "$dir/summary.txt"
+  echo "soak_rx_dropped_total=$total_rx_drops" | tee -a "$dir/summary.txt"
   if (( kills > 0 )); then
     echo "WARNING: systemd journal still contains SIGKILL/stop-timeout evidence during soak." | tee -a "$dir/summary.txt"
     return 2
