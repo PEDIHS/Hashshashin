@@ -131,6 +131,7 @@ func TestConcurrentSendUsesUniqueNonces(t *testing.T) {
 					t.Errorf("sendEncrypted: %v", err)
 					return
 				}
+			}
 		}()
 	}
 	wg.Wait()
