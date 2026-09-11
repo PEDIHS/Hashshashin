@@ -36,27 +36,23 @@ func applyPerformanceDefaults(p *PerformanceConfig) {
 		cpus = 1
 	}
 
-	var queues, workers, txq, sock int
+	var queues, txq, sock int
 	switch p.Profile {
 	case "balance":
 		queues = clampInt(cpus, 1, 2)
-		workers = clampInt(cpus, 1, 2)
 		txq = 2048
 		sock = 4 * 1024 * 1024
 	case "throughput":
 		queues = clampInt(cpus, 1, 8)
-		workers = clampInt(cpus, 1, 8)
 		txq = 8192
 		sock = 16 * 1024 * 1024
 	case "turbo", "custom":
 		queues = clampInt(cpus, 1, 4)
-		workers = clampInt(cpus, 1, 4)
 		txq = 4096
 		sock = 8 * 1024 * 1024
 	default:
 		// Validation returns the useful error after defaults are applied.
 		queues = clampInt(cpus, 1, 4)
-		workers = clampInt(cpus, 1, 4)
 		txq = 4096
 		sock = 8 * 1024 * 1024
 	}
@@ -65,7 +61,17 @@ func applyPerformanceDefaults(p *PerformanceConfig) {
 		p.TunQueues = queues
 	}
 	if p.ReceiveWorkers == 0 {
-		p.ReceiveWorkers = workers
+		p.ReceiveWorkers = 1
+	}
+	// A single UDP carrier socket is one ordered outer flow. Multiple goroutines
+	// may read that socket concurrently, but scheduling can complete/decrypt
+	// adjacent datagrams out of order and create artificial TCP reordering in a
+	// Full Tunnel. Official presets therefore keep one carrier receive worker;
+	// the expensive Iran upload path is still parallelized by TUN multi-queue.
+	// Custom remains available for experiments until true multi-flow/multipath
+	// transport can give each receive worker an independent ordered outer flow.
+	if p.Profile != "custom" {
+		p.ReceiveWorkers = 1
 	}
 	if p.TxQueueLen == 0 {
 		p.TxQueueLen = txq
