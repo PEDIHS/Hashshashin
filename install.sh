@@ -57,13 +57,13 @@ install_deps(){
   if have apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y ca-certificates curl git golang-go iproute2 iptables iperf3 kmod procps >/dev/null
+    apt-get install -y ca-certificates curl git golang-go iproute2 iptables iperf3 kmod procps python3 >/dev/null
   elif have dnf; then
-    dnf install -y ca-certificates curl git golang iproute iptables iperf3 kmod procps-ng >/dev/null
+    dnf install -y ca-certificates curl git golang iproute iptables iperf3 kmod procps-ng python3 >/dev/null
   else
     die "Installer رسمی فعلاً apt و dnf را پشتیبانی می‌کند."
   fi
-  for c in git go ip iptables systemctl sysctl tc; do have "$c" || die "Missing command: $c"; done
+  for c in git go ip iptables systemctl sysctl tc iperf3 python3; do have "$c" || die "Missing command: $c"; done
 }
 
 build_install(){
