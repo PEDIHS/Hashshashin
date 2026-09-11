@@ -58,15 +58,18 @@ server(){
   need iperf3; need ss
   local port="${1:-$PORT_DEFAULT}"
   valid_port "$port" || fail "invalid port: $port"
+
   if ss -H -ltn 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"; then
-    echo "[hsh-bench] TCP/$port is already listening."
+    echo "[hsh-bench] TCP/$port is already listening; leaving the existing listener untouched."
+    echo "[hsh-bench] if this is not iperf3, choose another benchmark port."
   else
     echo "[hsh-bench] starting persistent iperf3 server on TCP/$port"
     iperf3 -s -D -p "$port"
   fi
+
   for _ in 1 2 3 4 5; do
     if ss -H -ltn 2>/dev/null | grep -Eq "[:.]${port}[[:space:]]"; then
-      echo "[hsh-bench] server ready: TCP/$port"
+      echo "[hsh-bench] listener ready: TCP/$port"
       echo "[hsh-bench] keep this port allowed only from the benchmark peer while testing."
       return 0
     fi
@@ -79,7 +82,12 @@ wait_peer(){
   local host="$1" port="$2" attempt
   echo "[hsh-bench] preflight $host:$port"
   for attempt in 1 2 3 4 5; do
-    if timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+    if python3 - "$host" "$port" >/dev/null 2>&1 <<'PY'
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3):
+    pass
+PY
+    then
       echo "[hsh-bench] peer is reachable (attempt $attempt/5)"
       return 0
     fi
@@ -144,7 +152,7 @@ PY
 }
 
 client(){
-  need iperf3; need python3; need timeout; need ip
+  need iperf3; need python3; need ip
   local host="${1:-}" port="${2:-$PORT_DEFAULT}" runs="${3:-$RUNS_DEFAULT}" parallel="${4:-$PARALLEL_DEFAULT}"
   [[ -n "$host" ]] || fail "HOST is required"
   valid_port "$port" || fail "invalid port: $port"
