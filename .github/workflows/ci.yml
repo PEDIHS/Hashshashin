@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main, 'dev/**', 'feat/**' ]
+    branches: [ main, 'dev/**', 'feat/**', 'perf/**' ]
   pull_request:
 
 jobs:
@@ -26,3 +26,6 @@ jobs:
         run: bash -n install.sh
       - name: Manager syntax
         run: bash -n packaging/hashshashin-manager.sh
+      - name: Benchmark tool syntax
+        if: hashFiles('tools/hsh-bench.sh') != ''
+        run: bash -n tools/hsh-bench.sh

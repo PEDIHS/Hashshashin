@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -14,11 +15,19 @@ const (
 )
 
 func setupTun(c *Config) error {
-	if err := runCmd("ip", "link", "set", "dev", c.Tun.Name, "up", "mtu", strconv.Itoa(c.Tun.MTU)); err != nil {
+	if err := runCmd("ip", "link", "set", "dev", c.Tun.Name, "mtu", strconv.Itoa(c.Tun.MTU), "txqueuelen", strconv.Itoa(c.Performance.TxQueueLen)); err != nil {
+		return err
+	}
+	if err := runCmd("ip", "link", "set", "dev", c.Tun.Name, "up"); err != nil {
 		return err
 	}
 	if err := runCmd("ip", "addr", "replace", c.Tun.LocalCIDR, "dev", c.Tun.Name); err != nil {
 		return err
+	}
+	if c.Performance.Qdisc != "none" {
+		if out, err := exec.Command("tc", "qdisc", "replace", "dev", c.Tun.Name, "root", c.Performance.Qdisc).CombinedOutput(); err != nil {
+			log.Printf("warning: qdisc %s on %s not applied: %v: %s", c.Performance.Qdisc, c.Tun.Name, err, strings.TrimSpace(string(out)))
+		}
 	}
 	if err := runCmd("sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return err
@@ -135,8 +144,6 @@ func setupKharejRouting(c *Config) error {
 			return nil
 		}
 
-		// Smart Return can route service responses through hsh0, while carrier
-		// and health-probe sockets remain forced to the normal Internet via 0x77.
 		if err := setupTransportBypass(c); err != nil {
 			return err
 		}

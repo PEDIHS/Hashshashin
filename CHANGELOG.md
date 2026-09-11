@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.0-alpha — Data Plane Performance & Reproducibility
+
+- Reworked Linux TUN from a single file descriptor to `IFF_MULTI_QUEUE` with automatic fallback to single-queue kernels.
+- Added parallel TUN egress pumps so packet encryption/carrier writes are no longer forced through one `tun.Read` goroutine.
+- Added configurable UDP receive workers for multi-core processing.
+- Removed hot-path AES-GCM allocations by pooling encryption buffers and decrypting authenticated payloads in place.
+- Removed per-packet UDP peer resolution by caching resolved peer addresses.
+- Added carrier socket-buffer tuning for UDP, TCP and KCP.
+- Raised the default TUN `txqueuelen` from the kernel-style shallow value to 4096 in the Turbo profile and added `fq_codel` by default.
+- Added Balance, Turbo, Throughput and Custom performance profiles.
+- Added conservative socket/backlog ceilings without silently enabling BBR or changing the host firewall policy.
+- Replaced current-session-only journal counters with cumulative runtime metrics that survive rekey/session replacement.
+- Added 10-second data-plane telemetry: data/control packets, Mbit/s, TUN drop counters, send/decrypt/replay/no-session errors and session idle time.
+- Added graceful SIGTERM worker shutdown and increased systemd `TimeoutStopSec` to 30 seconds to avoid routine restart SIGKILLs.
+- Added `hsh-bench`: persistent iperf3 server, connection-refused retries, warm-up, repeated forward/reverse tests, parallel streams, raw JSON capture and median/min/max/spread reporting.
+- Added Manager visibility for requested/actual queue length, TUN queues, qdisc and drop counters, plus direct benchmark launching.
+- Added race-tested concurrent encryption checks to prove unique GCM packet counters/nonces under parallel send workers.
+- Added explicit security gate issue requiring independent audit and two-host soak testing before stable v1.0.
+
+> v0.3.0 remains alpha. CI validates concurrency and software regressions, but real throughput improvement must be demonstrated with repeated two-VPS benchmarks. Direct Return only removes the downlink from the HSH1 tunnel; it cannot improve a path whose bottleneck is elsewhere (host CPU, conntrack, NIC, provider routing or the direct return link itself).
+
 ## v0.2.0-alpha — Multi-Transport & Smart Return
 
 - Added pluggable carrier abstraction below HSH1.

@@ -12,13 +12,16 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 var buildRef = "source"
 
 const (
-	version     = "0.2.0-alpha"
+	version     = "0.3.0-alpha"
 	managerPath = "/usr/local/libexec/hashshashin-manager"
 )
 
@@ -67,7 +70,7 @@ func main() {
 		return
 	}
 	if *check {
-		fmt.Printf("Hashshashin %s: config ok (transport=%s)\n", version, cfg.Transport.Type)
+		fmt.Printf("Hashshashin %s: config ok (transport=%s profile=%s queues=%d)\n", version, cfg.Transport.Type, cfg.Performance.Profile, cfg.Performance.TunQueues)
 		return
 	}
 	if os.Geteuid() != 0 {
@@ -117,6 +120,12 @@ func printConfigSummary(c *Config) {
 	fmt.Printf("carrier_listen=%s\n", c.Transport.Listen)
 	fmt.Printf("carrier_peer=%s\n", peer)
 	fmt.Printf("service_ports=%s\n", strings.Join(ports, ","))
+	fmt.Printf("performance_profile=%s\n", c.Performance.Profile)
+	fmt.Printf("tun_queues=%d\n", c.Performance.TunQueues)
+	fmt.Printf("receive_workers=%d\n", c.Performance.ReceiveWorkers)
+	fmt.Printf("tx_queue_len=%d\n", c.Performance.TxQueueLen)
+	fmt.Printf("qdisc=%s\n", c.Performance.Qdisc)
+	fmt.Printf("socket_buffer=%d\n", c.Performance.SocketBuffer)
 	fmt.Printf("smart_return=%t\n", c.SmartReturn.Enabled)
 	if c.SmartReturn.Enabled {
 		fmt.Printf("smart_probe_port=%d\n", c.SmartReturn.ProbePort)
@@ -131,12 +140,16 @@ func printConfigSummary(c *Config) {
 }
 
 func run(c *Config) error {
-	log.Printf("Hashshashin %s starting role=%s mode=%s transport=%s smart-return=%t", version, c.Role, c.Mode, c.Transport.Type, c.SmartReturn.Enabled)
-	tun, err := openTun(c.Tun.Name)
+	log.Printf("Hashshashin %s starting role=%s mode=%s transport=%s smart-return=%t profile=%s", version, c.Role, c.Mode, c.Transport.Type, c.SmartReturn.Enabled, c.Performance.Profile)
+	tun, err := openTun(c.Tun.Name, c.Performance.TunQueues)
 	if err != nil {
 		return err
 	}
 	defer tun.Close()
+	log.Printf("tun=%s queues=%d requested=%d txqlen=%d qdisc=%s", c.Tun.Name, tun.QueueCount(), c.Performance.TunQueues, c.Performance.TxQueueLen, c.Performance.Qdisc)
+	if tun.QueueCount() != c.Performance.TunQueues {
+		log.Printf("warning: kernel did not accept requested TUN multi-queue; using %d queue(s)", tun.QueueCount())
+	}
 
 	cleanupSmartReturnPolicy(c)
 	cleanupRouting(c)
@@ -171,48 +184,103 @@ func run(c *Config) error {
 		return err
 	}
 	defer carrier.Close()
-	log.Printf("carrier=%s listen=%s peer=%s", carrier.Name(), c.Transport.Listen, c.Transport.Peer)
+	log.Printf("carrier=%s listen=%s peer=%s socket-buffer=%d", carrier.Name(), c.Transport.Listen, c.Transport.Peer, c.Performance.SocketBuffer)
 
 	st := &tunnelState{hellos: make(map[[32]byte]helloRecord)}
 	if c.SmartReturn.Enabled {
 		st.initProbeAck()
 	}
-	go recvLoop(ctx, carrier, tun, key, st, c.Role)
+
+	var wg sync.WaitGroup
+	start := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
+
+	recvWorkers := 1
+	if c.Transport.Type == "udp" {
+		recvWorkers = c.Performance.ReceiveWorkers
+	}
+	for i := 0; i < recvWorkers; i++ {
+		start(func() { recvLoop(ctx, carrier, tun, key, st, c.Role) })
+	}
+	log.Printf("data-plane workers tun-tx=%d carrier-rx=%d", tun.QueueCount(), recvWorkers)
 
 	if c.Role == "iran" {
-		go clientSupervisor(ctx, carrier, key, st, c)
+		start(func() { clientSupervisor(ctx, carrier, key, st, c) })
 		if c.SmartReturn.Enabled {
-			go runDirectProbeResponder(ctx, c, key, carrier, st)
+			start(func() { runDirectProbeResponder(ctx, c, key, carrier, st) })
 		}
 	} else {
-		go serverSupervisor(ctx, carrier, st, c)
+		start(func() { serverSupervisor(ctx, carrier, st, c) })
 		if c.SmartReturn.Enabled {
-			go runDirectProbeMonitor(ctx, c, key, st)
+			start(func() { runDirectProbeMonitor(ctx, c, key, st) })
 		}
 	}
-	go statsLoop(ctx, st)
+	start(func() { statsLoop(ctx, st, c) })
 
+	errCh := make(chan error, 1)
+	for q := 0; q < tun.QueueCount(); q++ {
+		queue := q
+		start(func() {
+			if err := tunSendLoop(ctx, tun, queue, carrier, st); err != nil && ctx.Err() == nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+		})
+	}
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		log.Printf("shutdown requested; stopping data plane")
+	case runErr = <-errCh:
+		log.Printf("data-plane error: %v", runErr)
+		cancel()
+	}
+
+	// Closing the FDs is intentional: it wakes goroutines blocked in TUN or
+	// carrier reads so systemd restart does not have to SIGKILL the process.
+	_ = carrier.Close()
+	_ = tun.Close()
+
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		_ = carrier.Close()
-		_ = tun.Close()
+		wg.Wait()
+		close(done)
 	}()
+	select {
+	case <-done:
+		log.Printf("shutdown complete")
+	case <-time.After(5 * time.Second):
+		log.Printf("warning: worker shutdown exceeded 5s; returning to systemd cleanup")
+	}
+	return runErr
+}
 
+func tunSendLoop(ctx context.Context, tun *tunDevice, queue int, carrier packetCarrier, st *tunnelState) error {
 	buf := make([]byte, 65535)
 	for {
-		n, err := tun.Read(buf)
+		n, err := tun.ReadQueue(queue, buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("tun read: %w", err)
+			atomic.AddUint64(&st.metrics.tunReadErrors, 1)
+			return fmt.Errorf("tun queue %d read: %w", queue, err)
 		}
 		ss := st.loadSession()
 		if ss == nil {
+			atomic.AddUint64(&st.metrics.noSessionDrops, 1)
 			continue
 		}
-		if err := sendEncrypted(carrier, ss, msgData, buf[:n]); err != nil {
-			log.Printf("%s send: %v", carrier.Name(), err)
+		if err := sendEncrypted(carrier, ss, msgData, buf[:n]); err != nil && ctx.Err() == nil {
+			log.Printf("%s send queue=%d: %v", carrier.Name(), queue, err)
 		}
 	}
 }

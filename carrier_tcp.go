@@ -6,6 +6,16 @@ import (
 	"net"
 )
 
+func tuneTCPConn(conn net.Conn, socketBuffer int) {
+	_ = markStreamConn(conn)
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetReadBuffer(socketBuffer)
+		_ = tc.SetWriteBuffer(socketBuffer)
+	}
+}
+
 func newTCPCarrier(ctx context.Context, c *Config) (packetCarrier, error) {
 	s := &streamCarrier{name: "tcp", ctx: ctx, defaultID: "tcp-peer"}
 	if c.Role == "iran" {
@@ -15,11 +25,7 @@ func newTCPCarrier(ctx context.Context, c *Config) (packetCarrier, error) {
 			if err != nil {
 				return nil, fmt.Errorf("dial TCP carrier %s: %w", peer, err)
 			}
-			_ = markStreamConn(conn)
-			if tc, ok := conn.(*net.TCPConn); ok {
-				_ = tc.SetNoDelay(true)
-				_ = tc.SetKeepAlive(true)
-			}
+			tuneTCPConn(conn, c.Performance.SocketBuffer)
 			return conn, nil
 		}
 		return s, nil
@@ -30,12 +36,6 @@ func newTCPCarrier(ctx context.Context, c *Config) (packetCarrier, error) {
 		return nil, fmt.Errorf("listen TCP carrier %s: %w", c.Transport.Listen, err)
 	}
 	s.listener = ln
-	s.tune = func(conn net.Conn) {
-		_ = markStreamConn(conn)
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-			_ = tc.SetKeepAlive(true)
-		}
-	}
+	s.tune = func(conn net.Conn) { tuneTCPConn(conn, c.Performance.SocketBuffer) }
 	return s, nil
 }

@@ -2,7 +2,7 @@
 
 # حشاشین | Hashshashin
 
-### تونل مستقل L3 برای Linux با Multi-Transport، Direct Return و Smart Failover
+### تونل مستقل L3 برای Linux با Multi-Queue Data Plane، Direct Return و Smart Failover
 
 **آپلود از تونل؛ دانلود مستقیم از خارج؛ و در خرابی مسیر Direct، بازگشت خودکار دانلود به Tunnel**
 
@@ -11,9 +11,9 @@
 ![Linux](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)
 ![Transport](https://img.shields.io/badge/Carrier-UDP%20%7C%20TCP%20%7C%20KCP-blue)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
-![Status](https://img.shields.io/badge/Status-v0.2%20Alpha-orange)
+![Status](https://img.shields.io/badge/Status-v0.3%20Alpha-orange)
 
-[راهنمای فارسی](README_FA.md) · [English](README_EN.md) · [Transportها](docs/TRANSPORTS_FA.md) · [Smart Return](docs/SMART_RETURN_FA.md) · [معماری](docs/ARCHITECTURE.md) · [امنیت](SECURITY.md)
+[راهنمای فارسی](README_FA.md) · [English](README_EN.md) · [عملکرد v0.3](docs/PERFORMANCE_FA.md) · [Transportها](docs/TRANSPORTS_FA.md) · [Smart Return](docs/SMART_RETURN_FA.md) · [معماری](docs/ARCHITECTURE.md) · [امنیت](SECURITY.md)
 
 </div>
 
@@ -30,9 +30,11 @@ User Protocol
 VLESS / VMess / Trojan / Shadowsocks / WireGuard / ...
                          |
                          v
-                    Linux L3/TUN
-                         |
-                       HSH1
+                 Linux L3/TUN Multi-Queue
+                  /      |      |      \
+               queue0  queue1 queue2  queue3
+                  \      |      |      /
+                         HSH1
      HMAC handshake + AES-256-GCM + Replay Protection
                          |
                 Transport Manager
@@ -42,7 +44,7 @@ VLESS / VMess / Trojan / Shadowsocks / WireGuard / ...
                    Iran <-> Kharej
 ```
 
-> **وضعیت:** نسخه فعلی `v0.2.0-alpha` است. Core، Crypto و Carrierها در CI تست می‌شوند، اما Direct Return و Smart Return باید قبل از Production روی دو VPS و Provider واقعی verify شوند.
+> **وضعیت:** نسخه فعلی `v0.3.0-alpha` است. Core، Crypto، concurrency و Carrierها در CI تست می‌شوند، اما افزایش throughput و رفتار shutdown باید قبل از Production روی دو VPS و Provider واقعی با benchmark/soak test تأیید شوند. پروژه هنوز audit امنیتی مستقل نشده است.
 
 ---
 
@@ -86,11 +88,60 @@ Smart Return برای جلوگیری از flapping از failure/recovery thresho
 
 ---
 
+## Data Plane v0.3
+
+v0.2 یک حلقه اصلی سری داشت:
+
+```text
+hsh0 -> tun.Read -> AES-GCM -> carrier.Write
+```
+
+v0.3 این مسیر را برای Linux چندصفه می‌کند:
+
+```text
+              hsh0 / IFF_MULTI_QUEUE
+        ┌────────┼────────┬────────┐
+      queue0   queue1   queue2   queue3
+        │        │        │        │
+      pump     pump     pump     pump
+        └────────┴──── HSH1 ───────┘
+                       │
+                     Carrier
+```
+
+بهینه‌سازی‌های اصلی:
+
+- `IFF_MULTI_QUEUE` با fallback خودکار به single queue در kernel ناسازگار
+- چند TUN pump مستقل برای استفاده از چند CPU
+- چند UDP receive worker
+- AES-GCM buffer pool و decrypt in-place برای کاهش allocation/copy هر packet
+- cache شدن UDP peer address
+- socket buffer tuning برای UDP/TCP/KCP
+- `txqueuelen=4096` و `fq_codel` در پروفایل Turbo
+- آمار تجمعی که با rekey صفر نمی‌شود
+- نمایش `hsh0 tx_dropped/rx_dropped`
+- shutdown مبتنی بر SIGTERM/context به‌جای اتکا به SIGKILL
+
+Performance Profileها:
+
+| Profile | TUN Queue | qlen | Socket Buffer | کاربرد |
+|---|---:|---:|---:|---|
+| Balance | تا 2 | 2048 | 4 MiB | VPS کوچک/اشتراکی |
+| **Turbo** | تا 4 | 4096 | 8 MiB | پیش‌فرض عمومی |
+| Throughput | تا 8 | 8192 | 16 MiB | Bulk throughput |
+| Custom | دستی | دستی | دستی | تست کنترل‌شده |
+
+> بزرگ‌تر کردن queue به‌تنهایی performance fix نیست. `fq_codel` برای کنترل bufferbloat کنار queue عمیق‌تر استفاده می‌شود.
+
+**[راهنمای Performance و روش benchmark](docs/PERFORMANCE_FA.md)**
+
+---
+
 ## Carrierهای واقعی
 
 | Carrier | Underlay | وضعیت | کاربرد |
 |---|---|---:|---|
-| **UDP** | UDP | ✅ | کمترین سربار و latency |
+| **UDP** | UDP | ✅ | کمترین سربار و latency؛ انتخاب اول روی لینک تمیز |
 | **TCP** | framed TCP stream | ✅ | شبکه‌های محدودکننده UDP |
 | **KCP** | KCP over UDP | ✅ | loss/jitter و ARQ سریع |
 | **KCP + FEC 10/3** | KCP/FEC | ✅ | preset متعادل |
@@ -137,7 +188,7 @@ Installer مراحل زیر را انجام می‌دهد:
 [2/8] Download, test & build
 [3/8] Select server role
 [4/8] Tunnel mode & Smart Return
-[5/8] Select carrier transport
+[5/8] Carrier & performance profile
 [6/8] Network & service configuration
 [7/8] Peer & security
 [8/8] Start & verify
@@ -172,6 +223,15 @@ Enable automatic Direct → Tunnel → Direct failover? [Y]
 3) KCP/FEC
 ```
 
+و Performance Profile:
+
+```text
+1) Turbo
+2) Balance
+3) Throughput
+4) Custom
+```
+
 برای KCP:
 
 ```text
@@ -195,6 +255,7 @@ Enable automatic Direct → Tunnel → Direct failover? [Y]
 - Mode
 - Carrier
 - Carrier Port
+- Performance Profile
 - Service Ports
 - Smart Return settings
 - Shared Key
@@ -220,6 +281,8 @@ Port     : 9001 (default probe port)
 ```
 
 Probe Port را برای کل اینترنت باز نکنید.
+
+برای benchmark نیز port انتخابی `iperf3` (پیش‌فرض `39001/TCP`) را فقط موقتاً بین IP دو سرور اجازه دهید.
 
 ---
 
@@ -253,6 +316,8 @@ ip -4 addr show
 
 اگر فقط private IP دارید و Public IP توسط CGNAT/NAT بالادستی ارائه می‌شود، Direct Return در نسخه فعلی پشتیبانی نمی‌شود. در آن شرایط از Full Tunnel استفاده کنید.
 
+Direct Return فقط downlink HSH1 را حذف می‌کند. اگر bottleneck روی CPU/NIC/conntrack ایران، provider path یا خود مسیر مستقیم باشد، الزاماً bandwidth را بیشتر نمی‌کند. برای مقایسه Full و Direct از benchmark تکراری استفاده کنید، نه یک run منفرد.
+
 ---
 
 ## Routing Isolation
@@ -283,7 +348,9 @@ Dashboard شامل موارد زیر است:
 - Role / Mode
 - Carrier
 - TUN / MTU
-- RX/TX
+- Performance Profile
+- TUN queue count / txqueuelen / qdisc
+- TUN RX/TX و drop counters
 - Smart Return ON/OFF
 - مسیر فعلی `DIRECT` یا `TUNNEL`
 - Health Check
@@ -292,8 +359,21 @@ Dashboard شامل موارد زیر است:
 - Reconfigure
 - Update
 - Network Diagnostics
+- Reproducible Benchmark
 - Reset Network State
 - Uninstall
+
+Benchmark مستقیم:
+
+```bash
+# روی مقصد
+hsh-bench server 39001
+
+# روی سمت تست‌کننده: 5 run، هر run با 8 stream موازی
+hsh-bench client PEER_IP 39001 5 8
+```
+
+خروجی شامل raw JSON، median/min/max/stdev/spread و delta مربوط به TUN dropهاست.
 
 دستورات مستقیم:
 
@@ -331,6 +411,8 @@ GitHub Actions روی Go `1.18` و `1.22` اجرا می‌شود و شامل ا�
 - Unit Tests
 - Race Detector
 - HSH1 crypto/session tests
+- concurrent encryption test با 8 worker و بررسی uniqueness counter/nonce
+- cumulative metrics test across session replacement/rekey
 - UDP handshake + encrypted payload integration
 - TCP framed carrier integration
 - KCP/FEC integration
@@ -339,9 +421,9 @@ GitHub Actions روی Go `1.18` و `1.22` اجرا می‌شود و شامل ا�
 - encrypted probe ACK dispatch
 - `go vet`
 - `go build`
-- Installer/Manager shell syntax
+- Installer/Manager/Benchmark shell syntax
 
-CI جای تست infrastructure واقعی را نمی‌گیرد. برای Production باید TUN، conntrack/NAT، MTU، firewall و مسیر Direct روی VPS واقعی بررسی شوند.
+CI جای تست infrastructure واقعی را نمی‌گیرد. برای Production باید TUN multi-queue، conntrack/NAT، MTU، firewall، graceful restart و مسیر Direct روی VPS واقعی benchmark/soak شوند.
 
 ---
 
@@ -349,7 +431,7 @@ CI جای تست infrastructure واقعی را نمی‌گیرد. برای Prod
 
 Hashshashin policy اصلی Firewall سیستم را به `ACCEPT` تغییر نمی‌دهد و chainهای اختصاصی `HSH_*` ایجاد می‌کند. Shared Key را منتشر نکنید و SSH / پنل مدیریت / دیتابیس را جداگانه محدود کنید.
 
-پروتکل HSH1 هنوز audit امنیتی مستقل خارجی نشده است.
+پروتکل HSH1 و پیاده‌سازی multi-queue هنوز audit امنیتی مستقل خارجی نشده‌اند. Issue امنیتی پروژه audit و two-host soak را gate قبل از Stable v1.0 قرار می‌دهد.
 
 **[Security Policy](SECURITY.md)**
 
@@ -368,6 +450,10 @@ Hashshashin policy اصلی Firewall سیستم را به `ACCEPT` تغییر ن
 - [x] Smart Return Health Protocol
 - [x] Direct → Tunnel → Direct automatic failover
 - [x] Service-scoped return policy routing
+- [x] Linux TUN Multi-Queue Data Plane
+- [x] Queue/qdisc Performance Profiles
+- [x] Cumulative Data Plane Telemetry
+- [x] Reproducible Multi-Stream Benchmark Harness
 - [ ] Raw TCP / pcap carrier
 - [ ] QUIC / WSS carrier
 - [ ] Multipath / multi-carrier bonding
@@ -376,13 +462,13 @@ Hashshashin policy اصلی Firewall سیستم را به `ACCEPT` تغییر ن
 - [ ] Binary Releases
 - [ ] Debian/RPM Packages
 - [ ] External Security Audit
-- [ ] Multi-provider Benchmark
+- [ ] Multi-provider Benchmark / Soak Test
 
 ---
 
 ## استقلال پروژه
 
-Hashshashin کپی سورس Paqet، Backhaul یا BackPack نیست. ایده‌های معماری عمومی آن‌ها مطالعه شده‌اند، اما Core، HSH1، Routing Control، Installer و Smart Return مستقل پیاده‌سازی شده‌اند. Dependency خارجی KCP نیز به‌صورت شفاف از `xtaci/kcp-go` تحت مجوز MIT استفاده می‌شود.
+Hashshashin کپی سورس Paqet، Backhaul یا BackPack نیست. ایده‌های معماری عمومی آن‌ها مطالعه شده‌اند، اما Core، HSH1، Routing Control، Installer، Smart Return و Data Plane v0.3 مستقل پیاده‌سازی شده‌اند. Dependency خارجی KCP نیز به‌صورت شفاف از `xtaci/kcp-go` تحت مجوز MIT استفاده می‌شود.
 
 ---
 
@@ -390,8 +476,8 @@ Hashshashin کپی سورس Paqet، Backhaul یا BackPack نیست. ایده‌
 
 ### Hashshashin
 
-**L3 Data Plane · Multi-Transport · Direct Return · Smart Failover**
+**L3 Data Plane · Multi-Queue · Direct Return · Smart Failover**
 
-[راهنمای فارسی](README_FA.md) · [English](README_EN.md) · [Smart Return](docs/SMART_RETURN_FA.md)
+[راهنمای فارسی](README_FA.md) · [English](README_EN.md) · [Performance](docs/PERFORMANCE_FA.md) · [Smart Return](docs/SMART_RETURN_FA.md)
 
 </div>
