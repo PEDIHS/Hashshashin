@@ -37,6 +37,7 @@ default_iface(){ ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++)if($i==
 default_gateway(){ ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="via"){print $(i+1);exit}}'; }
 default_src(){ ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}'; }
 is_local_ip(){ ip -4 addr show dev "$1" | grep -qw "$2"; }
+min(){ (( $1 < $2 )) && echo "$1" || echo "$2"; }
 
 banner(){
   clear_screen
@@ -46,7 +47,7 @@ banner(){
   printf '%b\n' "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
   printf '%b\n' "              ${PURPLE}حشاشین • نصب و مدیریت حرفه‌ای${RESET}"
   echo
-  printf '%b\n' "${GRAY} Full Tunnel • Direct Return • Auto Failover • UDP • TCP • KCP/FEC${RESET}"
+  printf '%b\n' "${GRAY} Full Tunnel • Direct Return • Auto Failover • Multi-Queue TUN • UDP • TCP • KCP/FEC${RESET}"
 }
 
 cleanup_on_error(){ local ec=$?; [[ $ec -eq 0 ]] && return; echo; warn "عملیات با کد $ec متوقف شد؛ Config قبلی خودکار حذف نشده است."; }
@@ -56,13 +57,13 @@ install_deps(){
   if have apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y ca-certificates curl git golang-go iproute2 iptables kmod procps >/dev/null
+    apt-get install -y ca-certificates curl git golang-go iproute2 iptables iperf3 kmod procps >/dev/null
   elif have dnf; then
-    dnf install -y ca-certificates curl git golang iproute iptables kmod procps-ng >/dev/null
+    dnf install -y ca-certificates curl git golang iproute iptables iperf3 kmod procps-ng >/dev/null
   else
     die "Installer رسمی فعلاً apt و dnf را پشتیبانی می‌کند."
   fi
-  for c in git go ip iptables systemctl sysctl; do have "$c" || die "Missing command: $c"; done
+  for c in git go ip iptables systemctl sysctl tc; do have "$c" || die "Missing command: $c"; done
 }
 
 build_install(){
@@ -79,6 +80,7 @@ build_install(){
   install -m 0755 packaging/hashshashin-manager.sh "$MANAGER"
   install -m 0644 packaging/hashshashin.service "$SERVICE"
   install -d -m 0700 "$CONF_DIR"
+  if [[ -f tools/hsh-bench.sh ]]; then install -m 0755 tools/hsh-bench.sh /usr/local/bin/hsh-bench; fi
 }
 
 uninstall(){
@@ -88,7 +90,7 @@ uninstall(){
   ok "Network state cleaned."
   step 2 3 "Remove runtime"
   systemctl disable --now hashshashin >/dev/null 2>&1 || true
-  rm -f "$SERVICE" "$SYSCTL" "$BIN" "$MANAGER"; rm -rf "$SRC"; systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -f "$SERVICE" "$SYSCTL" "$BIN" "$MANAGER" /usr/local/bin/hsh-bench; rm -rf "$SRC"; systemctl daemon-reload >/dev/null 2>&1 || true
   ok "Runtime files removed."
   step 3 3 "Finished"
   printf '%b\n' "${GREEN}${BOLD}  Hashshashin حذف شد.${RESET} ${GRAY}Config در ${CONF_DIR} نگه داشته شد.${RESET}"
@@ -114,6 +116,7 @@ step 1 8 "System check & dependencies"
 printf '  OS       : %s\n' "$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}")"
 printf '  Kernel   : %s\n' "$(uname -r)"
 printf '  Arch     : %s\n' "$(uname -m)"
+printf '  CPU      : %s logical cores\n' "$(nproc 2>/dev/null || echo 1)"
 install_deps
 modprobe tun >/dev/null 2>&1 || true
 [[ -c /dev/net/tun ]] || die "/dev/net/tun در دسترس نیست؛ TUN/TAP را در پنل VPS فعال کنید."
@@ -126,7 +129,11 @@ printf '  Binary   : %s\n' "$($BIN -version)"
 ok "Core and Manager installed."
 
 cat > "$SYSCTL" <<'SYS'
+# Hashshashin forwarding and conservative high-throughput socket ceilings.
 net.ipv4.ip_forward=1
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.netdev_max_backlog=16384
 SYS
 sysctl --system >/dev/null || true
 if have timedatectl; then timedatectl set-ntp true >/dev/null 2>&1 || true; fi
@@ -134,7 +141,7 @@ if have timedatectl; then timedatectl set-ntp true >/dev/null 2>&1 || true; fi
 if [[ "$ACTION" == "--update" ]]; then
   step 3 8 "Validate existing configuration"
   [[ -f "$CONF" ]] || die "Config پیدا نشد؛ --reconfigure را اجرا کنید."
-  "$BIN" -check -c "$CONF"; ok "Config preserved and valid."
+  "$BIN" -check -c "$CONF"; ok "Config preserved and valid. Missing performance fields use the Turbo defaults automatically."
   step 4 8 "Restart service"
   systemctl daemon-reload; systemctl enable hashshashin >/dev/null 2>&1 || true; systemctl restart hashshashin; sleep 2
   systemctl is-active --quiet hashshashin || { journalctl -u hashshashin -n 60 --no-pager || true; die "Service failed after update."; }
@@ -142,10 +149,12 @@ if [[ "$ACTION" == "--update" ]]; then
   step 5 8 "Local health"
   ip link show hsh0 >/dev/null 2>&1 && ok "hsh0 is up." || warn "hsh0 not visible yet."
   [[ "$(sysctl -n net.ipv4.ip_forward)" == 1 ]] && ok "IPv4 forwarding enabled."
+  ip -details link show hsh0 2>/dev/null | grep -E 'qlen|mtu' || true
   step 6 8 "Feature compatibility"
-  "$BIN" -summary -c "$CONF" | grep -E '^(mode|transport|smart_return)=' || true
+  "$BIN" -summary -c "$CONF" | grep -E '^(mode|transport|smart_return|performance_profile|tun_queues|receive_workers|tx_queue_len|qdisc|socket_buffer)=' || true
   step 7 8 "Management"
   printf '%b\n' "  اجرا کنید: ${CYAN}${BOLD}hashshashin${RESET}"
+  printf '%b\n' "  Benchmark: ${CYAN}${BOLD}hsh-bench${RESET}"
   step 8 8 "Update complete"; ok "Hashshashin updated with existing Config."; exit 0
 fi
 
@@ -175,8 +184,8 @@ if [[ "$mode" == "direct-return" ]]; then
   fi
 fi
 
-step 5 8 "Select carrier transport"
-printf '%b\n' "  ${CYAN}1) UDP${RESET}        ${GRAY}Lowest overhead${RESET}"
+step 5 8 "Carrier & performance profile"
+printf '%b\n' "  ${CYAN}1) UDP${RESET}        ${GRAY}Lowest overhead; preferred on a clean path${RESET}"
 printf '%b\n' "  ${BLUE}2) TCP${RESET}        ${GRAY}For UDP-restricted networks${RESET}"
 printf '%b\n' "  ${PURPLE}3) KCP/FEC${RESET}    ${GRAY}ARQ + optional loss recovery${RESET}"
 transport_choice="$(ask 'Carrier' '1')"
@@ -186,6 +195,28 @@ if [[ "$transport" == kcp ]]; then
   printf '%b\n' "  ${GREEN}1) Balanced FEC 10/3${RESET}  ${CYAN}2) No FEC${RESET}  ${YELLOW}3) Strong FEC 10/5${RESET}"
   kp="$(ask 'KCP profile' '1')"; case "$kp" in 2) ;; 3) kcp_data=10; kcp_parity=5;; *) kcp_data=10; kcp_parity=3;; esac
 fi
+
+echo
+printf '%b\n' "  ${WHITE}${BOLD}Performance Profile${RESET}"
+printf '%b\n' "  ${GREEN}1) Turbo${RESET}       ${GRAY}recommended: multi-queue + qlen 4096 + fq_codel${RESET}"
+printf '%b\n' "  ${CYAN}2) Balance${RESET}     ${GRAY}small/shared VPS; lower memory/CPU${RESET}"
+printf '%b\n' "  ${PURPLE}3) Throughput${RESET}  ${GRAY}bulk bandwidth; deeper queue/buffers${RESET}"
+printf '%b\n' "  ${YELLOW}4) Custom${RESET}      ${GRAY}manual queue/worker/buffer values${RESET}"
+perf_choice="$(ask 'Performance' '1')"
+cpus="$(nproc 2>/dev/null || echo 1)"
+qdisc="fq_codel"; stats_interval=10
+case "$perf_choice" in
+  2) perf_profile="balance"; tun_queues="$(min "$cpus" 2)"; recv_workers="$(min "$cpus" 2)"; tx_queue_len=2048; socket_buffer=4194304;;
+  3) perf_profile="throughput"; tun_queues="$(min "$cpus" 8)"; recv_workers="$(min "$cpus" 8)"; tx_queue_len=8192; socket_buffer=16777216;;
+  4)
+    perf_profile="custom"
+    tun_queues="$(ask 'TUN queues (1-16)' "$(min "$cpus" 4)")"
+    recv_workers="$(ask 'UDP receive workers (1-16)' "$(min "$cpus" 4)")"
+    tx_queue_len="$(ask 'TUN txqueuelen' '4096')"
+    socket_buffer="$(ask 'Carrier socket buffer bytes' '8388608')"
+    qdisc="$(ask 'Qdisc (fq_codel/fq/none)' 'fq_codel')";;
+  *) perf_profile="turbo"; tun_queues="$(min "$cpus" 4)"; recv_workers="$(min "$cpus" 4)"; tx_queue_len=4096; socket_buffer=8388608;;
+esac
 
 step 6 8 "Network & service configuration"
 iface_default="$(default_iface)"; [[ -n "$iface_default" ]] || die "Default interface not detected."
@@ -214,7 +245,7 @@ if [[ "$role" == iran ]]; then
   foreign_ip="$(ask 'Kharej public IPv4' '')"; valid_ipv4 "$foreign_ip" || die "Invalid Kharej IPv4."
   iran_ip="$local_ip"; listen="0.0.0.0:$transport_port"; peer="$foreign_ip:$transport_port"; key="$($BIN -keygen)"; tun_cidr="10.77.0.1/30"; tun_peer="10.77.0.2"; lock=false
   echo; printf '%b\n' "${YELLOW}${BOLD}┌────────────── Shared Key ──────────────┐${RESET}"; printf '%b\n' "${WHITE}${BOLD}  $key${RESET}"; printf '%b\n' "${YELLOW}${BOLD}└─────────────────────────────────────────┘${RESET}"
-  printf '%b\n' "${GRAY}  Kharej باید دقیقاً همان Mode / Carrier / Port / Smart settings / Key را داشته باشد.${RESET}"
+  printf '%b\n' "${GRAY}  Kharej باید همان Mode / Carrier / Port / Smart settings / Performance profile / Key را داشته باشد.${RESET}"
   read -r -p "  بعد از ذخیره کلید Enter بزنید... " _
 else
   iran_ip="$(ask 'Iran public IPv4' '')"; valid_ipv4 "$iran_ip" || die "Invalid Iran IPv4."
@@ -237,6 +268,7 @@ cat > "$CONF.tmp" <<JSON
     "kcp": {"data_shards": $kcp_data, "parity_shards": $kcp_parity, "nodelay": $kcp_nodelay, "interval": $kcp_interval, "resend": $kcp_resend, "nc": $kcp_nc, "send_window": $kcp_sndwnd, "receive_window": $kcp_rcvwnd, "mtu": $kcp_mtu, "socket_buffer": $kcp_buffer}
   },
   "smart_return": {"enabled": $smart, "probe_port": $probe_port, "interval_seconds": $probe_interval, "timeout_seconds": $probe_timeout, "fail_threshold": $fail_threshold, "recover_threshold": $recover_threshold},
+  "performance": {"profile": "$perf_profile", "tun_queues": $tun_queues, "receive_workers": $recv_workers, "tx_queue_len": $tx_queue_len, "qdisc": "$qdisc", "socket_buffer": $socket_buffer, "stats_interval_seconds": $stats_interval},
   "tun": {"name": "hsh0", "local_cidr": "$tun_cidr", "peer_ip": "$tun_peer", "mtu": $mtu},
   "network": {"public_interface": "$iface", "public_ip": "$local_ip", "public_gateway": "$gateway", "foreign_public_ip": "$foreign_ip", "iran_public_ip": "$iran_ip", "lock_service_ports": $lock},
   "ports": [$ports_json]
@@ -253,7 +285,7 @@ echo
 printf '%b\n' "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}"
 printf '%b\n' "${GREEN}${BOLD}║${RESET}                 ${WHITE}${BOLD}INSTALLATION COMPLETE${RESET}                    ${GREEN}${BOLD}║${RESET}"
 printf '%b\n' "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
-printf '  Role          : %s\n  Mode          : %s\n  Carrier       : %s/%s\n  Service Ports : %s\n  TUN           : %s\n' "$role" "$mode" "${transport^^}" "$transport_port" "$ports_raw" "$tun_cidr"
+printf '  Role          : %s\n  Mode          : %s\n  Carrier       : %s/%s\n  Performance   : %s (%s TUN queues, qlen %s, %s)\n  Service Ports : %s\n  TUN           : %s\n' "$role" "$mode" "${transport^^}" "$transport_port" "$perf_profile" "$tun_queues" "$tx_queue_len" "$qdisc" "$ports_raw" "$tun_cidr"
 [[ "$transport" == kcp ]] && printf '  KCP FEC       : %s/%s\n' "$kcp_data" "$kcp_parity"
 if [[ "$smart" == true ]]; then printf '  Smart Return  : ON (UDP probe %s, fail/recover %s/%s)\n' "$probe_port" "$fail_threshold" "$recover_threshold"; else printf '  Smart Return  : OFF\n'; fi
 
@@ -261,6 +293,7 @@ echo
 [[ "$transport" == tcp ]] && printf '%b\n' "${GRAY}  Provider Firewall: TCP/${transport_port} فقط بین ایران و خارج.${RESET}" || printf '%b\n' "${GRAY}  Provider Firewall: UDP/${transport_port} فقط بین ایران و خارج.${RESET}"
 [[ "$smart" == true ]] && printf '%b\n' "${GRAY}  Smart Return: UDP/${probe_port} را از Kharej IP به Iran IP اجازه دهید.${RESET}"
 printf '%b\n' "  مدیریت: ${CYAN}${BOLD}hashshashin${RESET}"
-if [[ "$role" == iran ]]; then printf '%b\n' "${YELLOW}${BOLD}  NEXT:${RESET} روی Kharej همان Mode/Carrier/Port/Smart settings/Shared Key را وارد کنید."; else printf '%b\n' "${GREEN}${BOLD}  NEXT:${RESET} Health Check را روی هر دو سرور اجرا کنید."; fi
+printf '%b\n' "  تست تکرارپذیر: ${CYAN}${BOLD}hsh-bench${RESET}"
+if [[ "$role" == iran ]]; then printf '%b\n' "${YELLOW}${BOLD}  NEXT:${RESET} روی Kharej همان Mode/Carrier/Port/Smart/Performance/Shared Key را وارد کنید."; else printf '%b\n' "${GREEN}${BOLD}  NEXT:${RESET} Health Check را روی هر دو سرور اجرا کنید."; fi
 
 echo; if yesno 'Open Hashshashin Manager now?' 'Y'; then exec "$MANAGER"; fi
