@@ -60,6 +60,7 @@ type session struct {
 	lastSeen int64
 	txBytes  uint64
 	rxBytes  uint64
+	metrics  *runtimeMetrics
 }
 
 func (s *session) touch()             { atomic.StoreInt64(&s.lastSeen, time.Now().UnixNano()) }
