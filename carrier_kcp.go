@@ -20,6 +20,10 @@ func newKCPCarrier(ctx context.Context, c *Config) (packetCarrier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen KCP UDP socket %s: %w", c.Transport.Listen, err)
 	}
+	if u, ok := pc.(*net.UDPConn); ok {
+		_ = u.SetReadBuffer(c.Performance.SocketBuffer)
+		_ = u.SetWriteBuffer(c.Performance.SocketBuffer)
+	}
 
 	s := &streamCarrier{name: "kcp", ctx: ctx, defaultID: "kcp-peer"}
 	s.tune = func(conn net.Conn) { tuneKCPSession(conn, c) }
@@ -63,8 +67,12 @@ func tuneKCPSession(conn net.Conn, c *Config) {
 	s.SetWindowSize(c.Transport.KCP.SendWindow, c.Transport.KCP.ReceiveWindow)
 	s.SetMtu(c.Transport.KCP.MTU)
 	s.SetACKNoDelay(true)
-	_ = s.SetReadBuffer(c.Transport.KCP.SocketBuffer)
-	_ = s.SetWriteBuffer(c.Transport.KCP.SocketBuffer)
+	buf := c.Transport.KCP.SocketBuffer
+	if c.Performance.SocketBuffer > buf {
+		buf = c.Performance.SocketBuffer
+	}
+	_ = s.SetReadBuffer(buf)
+	_ = s.SetWriteBuffer(buf)
 }
 
 func randomConversationID() (uint32, error) {
