@@ -51,6 +51,7 @@ type Config struct {
 		KCP                   KCPConfig `json:"kcp,omitempty"`
 	} `json:"transport"`
 	SmartReturn SmartReturnConfig `json:"smart_return,omitempty"`
+	Performance PerformanceConfig `json:"performance,omitempty"`
 	Tun         struct {
 		Name      string `json:"name"`
 		LocalCIDR string `json:"local_cidr"`
@@ -122,6 +123,11 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if c.Transport.RekeyMinutes < 5 || c.Transport.RekeyMinutes > 1440 {
 		return nil, errors.New("rekey_minutes must be between 5 and 1440")
+	}
+
+	applyPerformanceDefaults(&c.Performance)
+	if err := validatePerformance(c.Performance); err != nil {
+		return nil, err
 	}
 
 	if c.Transport.Type == "kcp" {
